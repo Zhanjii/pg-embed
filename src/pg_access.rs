@@ -358,15 +358,14 @@ impl PgAccess {
 
         // Match the async spawn path in command_executor::generate_command and
         // suppress the console window Windows would allocate for pg_ctl on a
-        // GUI-subsystem parent. See that function for the full flag rationale.
+        // GUI-subsystem parent. See that function for why we use
+        // CREATE_NO_WINDOW alone (not combined with DETACHED_PROCESS) — pg_ctl
+        // spawns postgres via `cmd /C` and needs a hidden console to inherit.
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            const DETACHED_PROCESS: u32 = 0x0000_0008;
-            command
-                .get_mut()
-                .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
+            command.get_mut().creation_flags(CREATE_NO_WINDOW);
         }
 
         command

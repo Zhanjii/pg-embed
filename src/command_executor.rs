@@ -123,25 +123,33 @@ where
         // console-subsystem child (pg_ctl, initdb, postgres) when the parent
         // process has no console of its own (GUI-subsystem apps).
         //
-        // DETACHED_PROCESS (0x0000_0008) is the load-bearing flag: per
-        // https://learn.microsoft.com/en-us/windows/win32/procthread/process-creation-flags
-        // the child receives no console, and CREATE_NO_WINDOW is *ignored*
-        // when combined with DETACHED_PROCESS. We OR in CREATE_NO_WINDOW
-        // (0x0800_0000) anyway for intent-documentation and as defense in
-        // depth if Microsoft ever reinterprets the combination — the
-        // practical runtime effect today is DETACHED_PROCESS alone.
+        // Flag choice — CREATE_NO_WINDOW alone, NOT combined with
+        // DETACHED_PROCESS:
         //
-        // grandchild caveat: Windows creation flags do not propagate through
-        // `CreateProcess` calls pg_ctl itself makes to launch postgres.exe;
-        // those flags are set by pg_ctl source. Empirically, pg_ctl on
-        // Windows already passes CREATE_NO_WINDOW to postgres.exe, so the
-        // detached parent is what was leaking a console in the dashboard
-        // observation.
+        // - CREATE_NO_WINDOW (0x0800_0000): child gets a console, but its
+        //   window is hidden. The console HANDLE exists and can be inherited
+        //   by grandchildren.
+        // - DETACHED_PROCESS (0x0000_0008): child gets NO console at all.
+        //
+        // `pg_ctl` on Windows internally spawns postgres via a
+        // `cmd /C "postgres.exe -D ... < nul 2>&1"` wrapper using
+        // `CreateProcess` with ZERO creation flags. When a child is spawned
+        // with zero flags and the PARENT has no console, Windows allocates a
+        // fresh console for the child — that's the visible cmd window users
+        // saw on v2.0.3. By giving pg_ctl a hidden console via
+        // CREATE_NO_WINDOW, the cmd grandchild inherits pg_ctl's hidden
+        // console instead of allocating its own. No visible window at any
+        // level of the spawn tree.
+        //
+        // The prior fork iteration used CREATE_NO_WINDOW | DETACHED_PROCESS.
+        // Per MSDN, that combination makes DETACHED_PROCESS win and
+        // CREATE_NO_WINDOW is ignored — pg_ctl ended up with no console at
+        // all, and cmd therefore allocated its own visible window. That was
+        // the bug.
         #[cfg(windows)]
         {
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            const DETACHED_PROCESS: u32 = 0x0000_0008;
-            command.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
+            command.creation_flags(CREATE_NO_WINDOW);
         }
 
         command
