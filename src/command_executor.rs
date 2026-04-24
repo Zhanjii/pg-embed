@@ -123,13 +123,20 @@ where
         // console-subsystem child (pg_ctl, initdb, postgres) when the parent
         // process has no console of its own (GUI-subsystem apps).
         //
-        // CREATE_NO_WINDOW (0x0800_0000) suppresses the direct child's console.
-        // DETACHED_PROCESS (0x0000_0008) ensures any grandchild spawned by
-        // pg_ctl (notably postgres.exe) does not inherit a fresh console
-        // either. Per Windows docs the flags are technically mutually exclusive,
-        // but OR-ing them is the idiomatic pattern in the Rust ecosystem and
-        // has the practical effect of suppressing both tiers. See
+        // DETACHED_PROCESS (0x0000_0008) is the load-bearing flag: per
         // https://learn.microsoft.com/en-us/windows/win32/procthread/process-creation-flags
+        // the child receives no console, and CREATE_NO_WINDOW is *ignored*
+        // when combined with DETACHED_PROCESS. We OR in CREATE_NO_WINDOW
+        // (0x0800_0000) anyway for intent-documentation and as defense in
+        // depth if Microsoft ever reinterprets the combination — the
+        // practical runtime effect today is DETACHED_PROCESS alone.
+        //
+        // grandchild caveat: Windows creation flags do not propagate through
+        // `CreateProcess` calls pg_ctl itself makes to launch postgres.exe;
+        // those flags are set by pg_ctl source. Empirically, pg_ctl on
+        // Windows already passes CREATE_NO_WINDOW to postgres.exe, so the
+        // detached parent is what was leaking a console in the dashboard
+        // observation.
         #[cfg(windows)]
         {
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
