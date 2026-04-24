@@ -118,6 +118,25 @@ where
     {
         let mut command = tokio::process::Command::new(executable_path);
         command.args(args);
+
+        // Suppress the console window Windows would otherwise allocate for a
+        // console-subsystem child (pg_ctl, initdb, postgres) when the parent
+        // process has no console of its own (GUI-subsystem apps).
+        //
+        // CREATE_NO_WINDOW (0x0800_0000) suppresses the direct child's console.
+        // DETACHED_PROCESS (0x0000_0008) ensures any grandchild spawned by
+        // pg_ctl (notably postgres.exe) does not inherit a fresh console
+        // either. Per Windows docs the flags are technically mutually exclusive,
+        // but OR-ing them is the idiomatic pattern in the Rust ecosystem and
+        // has the practical effect of suppressing both tiers. See
+        // https://learn.microsoft.com/en-us/windows/win32/procthread/process-creation-flags
+        #[cfg(windows)]
+        {
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            const DETACHED_PROCESS: u32 = 0x0000_0008;
+            command.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
+        }
+
         command
     }
 
@@ -190,7 +209,6 @@ where
         // let _ = tokio::task::spawn(async { Self::log_output(receiver).await });
         res
     }
-
 }
 
 #[async_trait]

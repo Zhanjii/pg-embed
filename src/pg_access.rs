@@ -355,6 +355,20 @@ impl PgAccess {
         command
             .get_mut()
             .args(&["stop", "-w", "-D", database_dir.to_str().unwrap()]);
+
+        // Match the async spawn path in command_executor::generate_command and
+        // suppress the console window Windows would allocate for pg_ctl on a
+        // GUI-subsystem parent. See that function for the full flag rationale.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            const DETACHED_PROCESS: u32 = 0x0000_0008;
+            command
+                .get_mut()
+                .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
+        }
+
         command
     }
 }
