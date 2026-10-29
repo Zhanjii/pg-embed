@@ -62,7 +62,7 @@ impl PgCommand {
         port: &u16,
     ) -> PgResult<AsyncCommandExecutor<PgServerStatus, PgEmbedError, PgProcessType>> {
         let pg_ctl_executable = pg_ctl_exe.as_os_str();
-        let port_arg = format!("-F -p {}", port.to_string());
+        let port_arg = Self::start_db_server_options(port);
         let args = [
             "-o",
             &port_arg,
@@ -82,6 +82,22 @@ impl PgCommand {
     }
 
     ///
+    /// Server options passed to postgres through `pg_ctl start -o`
+    ///
+    /// Upstream passes `-F` here, which turns fsync off. A host that loses
+    /// power with fsync off can be left with no valid checkpoint record and a
+    /// cluster that never starts again (`PANIC: could not locate a valid
+    /// checkpoint record`). Command-line options override postgresql.conf and
+    /// ALTER SYSTEM, so callers could not turn fsync back on. Only the port is
+    /// passed; callers that want faster writes can set `synchronous_commit =
+    /// off` per connection, which risks losing the last few commits but never
+    /// corrupts the cluster.
+    ///
+    fn start_db_server_options(port: &u16) -> String {
+        format!("-p {}", port)
+    }
+
+    ///
     /// Create pg_ctl stop command
     ///
     pub fn stop_db_executor(
@@ -98,5 +114,31 @@ impl PgCommand {
             )?;
 
         Ok(command_executor)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PgCommand;
+
+    #[test]
+    fn test_start_options_do_not_disable_fsync() {
+        let options = PgCommand::start_db_server_options(&15433);
+        let tokens: Vec<&str> = options.split_whitespace().collect();
+        assert!(
+            !tokens.contains(&"-F"),
+            "start options disable fsync: {}",
+            options
+        );
+        assert!(
+            !options.contains("fsync=off") && !options.contains("fsync=0"),
+            "start options disable fsync: {}",
+            options
+        );
+    }
+
+    #[test]
+    fn test_start_options_pass_port() {
+        assert_eq!(PgCommand::start_db_server_options(&15433), "-p 15433");
     }
 }
