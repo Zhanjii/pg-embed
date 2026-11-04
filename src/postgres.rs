@@ -151,11 +151,16 @@ impl PgEmbed {
                 ),
             });
         }
-        self.pg_access.mark_acquisition_in_progress().await?;
         // The guard only covers cancellation (this future dropped mid-await). Completed runs,
         // successful or failed, set the status explicitly below and then release it, so the
         // reset happens once and failure keeps its awaited, error-reporting path.
+        // It is armed before marking in progress because on the retry path the claim is
+        // already held, and that await contends with polling waiters for the status lock;
+        // a cancellation there would otherwise leave the status in progress forever. If
+        // marking itself fails, the unreleased guard clears the entry, which is right since
+        // this instance never acquired anything and waiters must be free to retry.
         let mut claim_guard = self.pg_access.acquisition_claim_guard();
+        self.pg_access.mark_acquisition_in_progress().await?;
         let result = match self.acquire_postgres_steps().await {
             Ok(()) => Ok(()),
             Err(error) => {

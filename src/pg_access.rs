@@ -137,10 +137,16 @@ impl PgAccess {
         // pg_executables_cached() then sees initdb and no download is attempted.
         // The exe suffix is included here (unlike the cache paths below) because
         // pg_executables_cached() opens the path as a file, which needs ".exe" on Windows.
+        // Joined per component: a "bin/x" literal would mix separators on Windows, and
+        // pg_ctl hands this path to `cmd /C` when spawning postgres.
         let (pg_ctl, init_db) = match &local_binaries_dir {
             Some(local_binaries_dir) => (
-                local_binaries_dir.join(format!("bin/pg_ctl{}", std::env::consts::EXE_SUFFIX)),
-                local_binaries_dir.join(format!("bin/initdb{}", std::env::consts::EXE_SUFFIX)),
+                local_binaries_dir
+                    .join("bin")
+                    .join(format!("pg_ctl{}", std::env::consts::EXE_SUFFIX)),
+                local_binaries_dir
+                    .join("bin")
+                    .join(format!("initdb{}", std::env::consts::EXE_SUFFIX)),
             ),
             None => {
                 // pg_ctl executable
@@ -234,9 +240,12 @@ impl PgAccess {
         }
         let mut missing: Vec<String> = ["initdb", "pg_ctl", "postgres"]
             .iter()
-            .map(|name| format!("bin/{}{}", name, std::env::consts::EXE_SUFFIX))
-            .filter_map(|relative| {
-                let path = dir.join(&relative);
+            .map(|name| format!("{}{}", name, std::env::consts::EXE_SUFFIX))
+            .filter_map(|file_name| {
+                // The label is for humans; the path is joined per component so Windows
+                // paths keep a single separator style.
+                let relative = format!("bin/{}", file_name);
+                let path = dir.join("bin").join(&file_name);
                 if !path.is_file() {
                     return Some(relative);
                 }
