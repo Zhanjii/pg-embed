@@ -6,7 +6,7 @@ ___
 
 ### Fix
 - A download answering with a non-success HTTP status now fails with `DownloadFailure` naming the url and status, instead of unpacking the error page as a zip
-- A failed or cancelled binaries acquisition no longer leaves its status "in progress", which made every other `PgEmbed` for the same cache directory in the process wait forever; after a failure exactly one waiter retries
+- A failed or cancelled binaries acquisition no longer leaves its status "in progress", which made every other `PgEmbed` for the same cache directory in the process wait forever; after a failure, one of the waiting instances claims the retry and the others keep waiting (an instance starting its very first acquisition at the same moment can still overlap, as before)
 
 ### Breaking Changes
 - `PgFetchSettings` has a new public field `local_binaries_dir`; struct literals that list every field must add `local_binaries_dir: None` (literals using `..Default::default()` are unaffected)

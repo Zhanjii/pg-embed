@@ -8,6 +8,8 @@
 # -D warnings) we deliberately do not fix, to keep the fork rebase-clean against
 # faokunega/pg-embed, so the clippy step fails only on warnings that are NOT in the
 # committed baseline.
+# Known gap: the per-message multiset comparison hides a new warning whose text matches a
+# baseline entry in the same file if an upstream instance disappears in the same change.
 #
 # The integration tests in tests/ are not run: they download binaries from Maven,
 # and postgres_tokio calls PgAccess::purge(), which deletes the user's whole

@@ -516,4 +516,57 @@ mod tests {
         );
         assert!(zip_files_under(&cache_dir).is_empty());
     }
+
+    // End to end for the claim guard: a timeout around acquisition (the typical way callers
+    // bound setup()) must not leave other instances waiting on an in-progress status forever.
+    #[tokio::test]
+    async fn cancelled_download_resets_acquisition_status_and_writes_no_zip() {
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let cache_dir = temporary_directory.path().join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        // Accepts the request and never answers, so the download is still in flight when the
+        // timeout drops the future.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (accepted_sender, mut accepted_receiver) = tokio::sync::oneshot::channel::<()>();
+        let stalled_server = tokio::spawn(async move {
+            let (_held_socket, _) = listener.accept().await.unwrap();
+            let _ = accepted_sender.send(());
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        // A struct literal: PgEmbed::new in remote mode would create the real user cache.
+        let mut pg = PgEmbed {
+            pg_settings: settings_for(temporary_directory.path().join("db")),
+            fetch_settings: PgFetchSettings {
+                host: format!("http://127.0.0.1:{}", port),
+                ..Default::default()
+            },
+            db_uri: "postgres://postgres:password@localhost:5432".to_string(),
+            server_status: Arc::new(Mutex::new(PgServerStatus::Uninitialized)),
+            shutting_down: false,
+            pg_access: crate::pg_access::access_for(&cache_dir),
+        };
+        // Drop must neither run pg_ctl nor clean anything up.
+        pg.shutting_down = true;
+        pg.pg_settings.persistent = true;
+
+        let outcome = tokio::time::timeout(Duration::from_millis(300), pg.acquire_postgres()).await;
+        assert!(outcome.is_err(), "the stalled download must time out");
+        assert!(
+            accepted_receiver.try_recv().is_ok(),
+            "the request must have reached the server before the cancellation"
+        );
+        // A contended status lock makes the guard reset through a spawned task, so poll.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while pg.pg_access.acquisition_status().await
+                != crate::pg_enums::PgAcquisitionStatus::Undefined
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a cancelled acquisition must reset the status");
+        assert!(zip_files_under(&cache_dir).is_empty());
+        stalled_server.abort();
+    }
 }
