@@ -145,7 +145,8 @@ impl PgAccess {
     ///
     /// Create a new instance
     ///
-    /// Directory structure for cached postgresql binaries will be created
+    /// Directory structure for cached postgresql binaries will be created.
+    /// In local mode no cache directory is created and `cache_dir` is the installation directory.
     ///
     pub async fn new(
         fetch_settings: &PgFetchSettings,
@@ -477,6 +478,9 @@ impl PgAccess {
     /// Atomically claim a retry after a peer's failed acquisition
     ///
     /// Check and insert happen under one lock so that exactly one waiter wins.
+    /// Remaining exception: an instance that saw `Undefined` before this claim (the unclaimed
+    /// first-acquisition path) can still overwrite it via `mark_acquisition_in_progress`; owner
+    /// checks stop it clearing the claim, but the two downloads can then overlap.
     ///
     async fn try_claim_acquisition(&self) -> bool {
         let mut lock = ACQUIRED_PG_BINS.lock().await;
@@ -972,9 +976,17 @@ mod tests {
         let cancelled_instance = access_for(cache.path());
         let claiming_peer = access_for(cache.path());
         claiming_peer.mark_acquisition_in_progress().await.unwrap();
-        drop(cancelled_instance.acquisition_claim_guard());
-        // Give a contended try_lock's spawned fallback time to run before asserting.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Holding the lock makes the guard's try_lock fail, so the spawned fallback path is
+        // exercised every run instead of only when a parallel test happens to contend.
+        {
+            let _held_lock = ACQUIRED_PG_BINS.lock().await;
+            drop(cancelled_instance.acquisition_claim_guard());
+        }
+        // The current-thread test runtime only runs the spawned reset when this task yields.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
         {
             let lock = ACQUIRED_PG_BINS.lock().await;
             let entry = lock

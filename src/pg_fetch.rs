@@ -116,7 +116,7 @@ impl PgFetchSettings {
     pub async fn fetch_postgres(&self) -> PgResult<Box<Bytes>> {
         let download_url = self.download_url();
         // The host may carry basic-auth credentials; only the redacted form is ever logged or put in errors.
-        let loggable_url = redact_url_credentials(&download_url);
+        let (loggable_url, url_has_credentials) = redact_url_credentials(&download_url);
         log::debug!("downloading PostgreSQL binaries from {}", loggable_url);
         let mut response: Response = reqwest::get(&download_url)
             .map_err(|e| PgEmbedError {
@@ -154,7 +154,7 @@ impl PgFetchSettings {
             // Some proxies (Artifactory, Nexus) echo request headers in error pages, which
             // would include the Authorization header built from credentials in `host`, so the
             // body is never logged for a credentialed request, not even at debug.
-            if url_has_credentials(&download_url) {
+            if url_has_credentials {
                 log::debug!(
                     "error response body from {} withheld because the request carried credentials, {} bytes",
                     loggable_url,
@@ -172,6 +172,7 @@ impl PgFetchSettings {
                         error
                     ),
                 };
+                // Debug, not warn, on purpose: mirror error pages can echo request headers (see above).
                 log::debug!(
                     "error response body from {}: {}",
                     loggable_url,
@@ -204,29 +205,23 @@ impl PgFetchSettings {
     }
 }
 
-/// Strip basic-auth credentials from a url so it is safe to log or embed in an error
-fn redact_url_credentials(url: &str) -> String {
+/// Strip basic-auth credentials from a url so it is safe to log or embed in an error.
+/// Also reports whether the url carried userinfo, i.e. whether the request sends an
+/// Authorization header.
+fn redact_url_credentials(url: &str) -> (String, bool) {
     match reqwest::Url::parse(url) {
         Ok(mut parsed) => {
-            if !parsed.username().is_empty() || parsed.password().is_some() {
+            let has_credentials = !parsed.username().is_empty() || parsed.password().is_some();
+            if has_credentials {
                 // These only fail for cannot-be-a-base urls, which cannot carry credentials.
                 let _ = parsed.set_username("");
                 let _ = parsed.set_password(None);
             }
-            parsed.to_string()
+            (parsed.to_string(), has_credentials)
         }
-        // An unparseable url may still embed credentials; reqwest fails on it too and its error source is attached.
-        Err(_) => "<unparseable download url>".to_string(),
-    }
-}
-
-/// Whether a url carries basic-auth userinfo, i.e. the request sends an Authorization header
-fn url_has_credentials(url: &str) -> bool {
-    match reqwest::Url::parse(url) {
-        Ok(parsed) => !parsed.username().is_empty() || parsed.password().is_some(),
-        // Callers use this to decide whether logging is safe; an unparseable url may still
-        // embed credentials, so it is treated as credentialed.
-        Err(_) => true,
+        // An unparseable url may still embed credentials, so it is hidden and treated as
+        // credentialed; reqwest fails on it too and its error source is attached.
+        Err(_) => ("<unparseable download url>".to_string(), true),
     }
 }
 
@@ -351,7 +346,7 @@ mod tests {
 
     #[test]
     fn redact_url_credentials_removes_user_and_password() {
-        let redacted =
+        let (redacted, _) =
             redact_url_credentials("https://user:secret@mirror.internal/maven2/some/file.jar");
         assert!(!redacted.contains("user"), "{}", redacted);
         assert!(!redacted.contains("secret"), "{}", redacted);
@@ -362,28 +357,26 @@ mod tests {
     #[test]
     fn redact_url_credentials_hides_unparseable_url() {
         assert_eq!(
-            redact_url_credentials("not a url user:secret@"),
+            redact_url_credentials("not a url user:secret@").0,
             "<unparseable download url>"
         );
     }
 
     #[test]
-    fn url_has_credentials_detects_userinfo() {
-        assert!(url_has_credentials(
-            "https://user:secret@mirror.internal/x.jar"
-        ));
-        assert!(url_has_credentials("https://user@mirror.internal/x.jar"));
-        assert!(url_has_credentials("https://:secret@mirror.internal/x.jar"));
+    fn redact_url_credentials_detects_userinfo() {
+        assert!(redact_url_credentials("https://user:secret@mirror.internal/x.jar").1);
+        assert!(redact_url_credentials("https://user@mirror.internal/x.jar").1);
+        assert!(redact_url_credentials("https://:secret@mirror.internal/x.jar").1);
     }
 
     #[test]
-    fn url_has_credentials_is_false_without_userinfo() {
-        assert!(!url_has_credentials("https://mirror.internal/x.jar"));
+    fn redact_url_credentials_reports_no_userinfo() {
+        assert!(!redact_url_credentials("https://mirror.internal/x.jar").1);
     }
 
     #[test]
-    fn url_has_credentials_treats_unparseable_url_as_credentialed() {
-        assert!(url_has_credentials("not a url user:secret@"));
+    fn redact_url_credentials_treats_unparseable_url_as_credentialed() {
+        assert!(redact_url_credentials("not a url user:secret@").1);
     }
 
     #[tokio::test]
