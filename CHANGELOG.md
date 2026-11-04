@@ -1,5 +1,7 @@
 # Unreleased (Zhanjii fork)
 ___
+This fork is consumed by git rev, not by version, so `Cargo.toml` stays at 0.7.x; a version cut from it would need a minor bump for the breaking changes below.
+
 ### Feature
 - `PgFetchSettings.local_binaries_dir` (default `None`) runs an existing PostgreSQL installation instead of downloading one; missing executables fail `PgEmbed::new` with `InvalidPgPackage`
 - `PgFetchSettings::download_url()` exposes the download url; a trailing `/` on `host` is ignored

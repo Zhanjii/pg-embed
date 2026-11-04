@@ -61,6 +61,8 @@ pub struct PgFetchSettings {
     /// but redacted from logs and errors.
     /// Only the userinfo part (`user:password@`) is redacted; tokens in the path or query
     /// string are logged as-is, so pass credentials as userinfo instead.
+    /// The url in logs and errors is normalized by the url parser (e.g. a lowercased host),
+    /// so it can differ in case or encoding from the configured value.
     pub host: String,
     /// The operation system
     pub operating_system: OperationSystem,
