@@ -32,6 +32,9 @@ pub const PG_V10: PostgresVersion = PostgresVersion("10.23.0");
 pub const PG_V9: PostgresVersion = PostgresVersion("9.6.24");
 
 /// Maximum number of bytes of an error response body that is logged
+///
+/// 512 is enough of an HTML error page to diagnose a bad mirror, while bounding
+/// what is buffered and logged.
 const MAX_LOGGED_BODY_BYTES: usize = 512;
 
 /// Settings that determine the postgres binary to be fetched
@@ -44,6 +47,8 @@ pub struct PgFetchSettings {
     /// under that base.
     /// Credentials in the host (`https://user:token@mirror`) are sent as basic auth
     /// but redacted from logs and errors.
+    /// Only the userinfo part (`user:password@`) is redacted; tokens in the path or query
+    /// string are logged as-is, so pass credentials as userinfo instead.
     pub host: String,
     /// The operation system
     pub operating_system: OperationSystem,
@@ -143,9 +148,15 @@ impl PgFetchSettings {
                 Some(error) => format!("<body unreadable: {}>", error),
             };
             log::warn!(
-                "downloading PostgreSQL binaries from {} failed with HTTP status {}, body: {}",
+                "downloading PostgreSQL binaries from {} failed with HTTP status {}",
                 loggable_url,
-                status,
+                status
+            );
+            // Debug only: some proxies (Artifactory, Nexus) echo request headers in error pages,
+            // which would include the Authorization header built from credentials in `host`.
+            log::debug!(
+                "error response body from {}: {}",
+                loggable_url,
                 body_for_log
             );
             return Err(PgEmbedError {
