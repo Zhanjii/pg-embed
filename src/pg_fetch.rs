@@ -54,7 +54,8 @@ pub struct PgFetchSettings {
     /// Directory of a complete existing postgresql installation (`bin/`, `lib/`, `share/`)
     ///
     /// `bin/` must hold `initdb`, `pg_ctl` and `postgres`, and `share/` must exist;
-    /// only `bin/` and `share/` are checked.
+    /// only `bin/` and `share/` are checked. `share/` must sit in the same directory as
+    /// `bin/`; split distro layouts (Debian/Ubuntu) are rejected.
     ///
     /// Must be the same major version as `version`; this is not checked.
     /// When set, pg-embed never downloads binaries and uses these executables instead.
@@ -189,7 +190,7 @@ fn redact_url_credentials(url: &str) -> String {
     }
 }
 
-/// Render an error response body for logging, cut to at most `MAX_LOGGED_BODY_BYTES`
+/// Render an error response body for logging, cut to about `MAX_LOGGED_BODY_BYTES` (plus a `...` marker)
 fn truncate_for_log(body: &[u8]) -> String {
     let text = String::from_utf8_lossy(body);
     if text.len() <= MAX_LOGGED_BODY_BYTES {
@@ -334,6 +335,24 @@ mod tests {
         let message = error.message.unwrap();
         assert!(!message.contains("secret"), "{}", message);
         assert!(message.contains("404"), "{}", message);
+    }
+
+    #[tokio::test]
+    async fn fetch_postgres_transport_error_does_not_leak_host_credentials() {
+        // The error source is the raw reqwest error; this pins that reqwest keeps stripping
+        // userinfo from its own url so an upgrade cannot silently start leaking credentials.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let settings = fixed_settings(&format!("http://user:secret@127.0.0.1:{}", port));
+        let error = settings.fetch_postgres().await.unwrap_err();
+        assert_eq!(error.error_type, PgEmbedErrorType::DownloadFailure);
+        let message = error.message.unwrap();
+        assert!(message.contains("failed to download"), "{}", message);
+        assert!(!message.contains("secret"), "{}", message);
+        let source = error.source.unwrap();
+        assert!(!format!("{:?}", source).contains("secret"), "{:?}", source);
+        assert!(!source.to_string().contains("secret"), "{}", source);
     }
 
     #[tokio::test]

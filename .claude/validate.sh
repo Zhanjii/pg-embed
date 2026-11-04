@@ -4,9 +4,10 @@
 # Why not the canonical one: `--all-features` cannot build here (the rt_* runtime
 # features pull three renamed copies of sqlx and are mutually exclusive by design),
 # Cargo.lock is gitignored so `--locked` has nothing to lock to, and the crate has
-# no sqlx offline data. Upstream code also carries clippy warnings (errors only under -D warnings) we deliberately do
-# not fix, to keep the fork rebase-clean against faokunega/pg-embed, so the clippy
-# step fails only on warnings that are NOT in the committed baseline.
+# no sqlx offline data. Upstream code also carries clippy warnings (errors only under
+# -D warnings) we deliberately do not fix, to keep the fork rebase-clean against
+# faokunega/pg-embed, so the clippy step fails only on warnings that are NOT in the
+# committed baseline.
 #
 # The integration tests in tests/ are not run: they download binaries from Maven,
 # and postgres_tokio calls PgAccess::purge(), which deletes the user's whole
