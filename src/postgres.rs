@@ -347,3 +347,65 @@ impl PgEmbed {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pg_fetch::{PgFetchSettings, PG_V15};
+
+    fn settings_for(database_dir: PathBuf) -> PgSettings {
+        PgSettings {
+            database_dir,
+            port: 5432,
+            user: "postgres".to_string(),
+            password: "password".to_string(),
+            auth_method: PgAuthMethod::ScramSha256,
+            persistent: true,
+            timeout: Some(Duration::from_secs(30)),
+            migration_dir: None,
+        }
+    }
+
+    #[test]
+    fn insync_call_shape_compiles_with_defaults() {
+        let fetch_settings = PgFetchSettings {
+            version: PG_V15,
+            ..Default::default()
+        };
+        let database = tempfile::tempdir().unwrap();
+        let pg_settings = settings_for(database.path().join("db"));
+        assert!(fetch_settings.local_binaries_dir.is_none());
+        assert_eq!(fetch_settings.host, "https://repo1.maven.org");
+        assert!(pg_settings.persistent);
+    }
+
+    #[tokio::test]
+    async fn local_binaries_dir_flows_through_pg_embed_new() {
+        let installation = tempfile::tempdir().unwrap();
+        let bin_dir = installation.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        for name in ["initdb", "pg_ctl", "postgres"] {
+            // Empty files: the Drop impl must never run anything real.
+            std::fs::write(
+                bin_dir.join(format!("{}{}", name, std::env::consts::EXE_SUFFIX)),
+                b"",
+            )
+            .unwrap();
+        }
+        let database = tempfile::tempdir().unwrap();
+        let mut pg = PgEmbed::new(
+            settings_for(database.path().join("db")),
+            PgFetchSettings {
+                local_binaries_dir: Some(installation.path().to_path_buf()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        // Drop would otherwise spawn the fake pg_ctl via stop_db_sync.
+        pg.shutting_down = true;
+        assert!(!pg.pg_access.acquisition_needed().await.unwrap());
+        assert!(pg.pg_access.pg_ctl_exe.starts_with(installation.path()));
+        assert!(pg.pg_access.init_db_exe.starts_with(installation.path()));
+    }
+}
