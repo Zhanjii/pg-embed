@@ -1,3 +1,12 @@
+# Unreleased (Zhanjii fork)
+___
+### Feature
+- `PgFetchSettings.local_binaries_dir` (default `None`) runs an existing PostgreSQL installation instead of downloading one; missing executables fail `PgEmbed::new` with `InvalidPgPackage`
+- `PgFetchSettings::download_url()` exposes the download url; a trailing `/` on `host` is ignored
+
+### Fix
+- A download answering with a non-success HTTP status now fails with `DownloadFailure` naming the url and status, instead of unpacking the error page as a zip
+
 # v0.6.5
 ___
 ### Fix
