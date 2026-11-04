@@ -198,6 +198,8 @@ impl PgAccess {
                 }
                 // Otherwise the failure only shows up later as a permission error from
                 // initdb or pg_ctl, far from the configuration that caused it.
+                // Any execute bit (owner, group or other) is accepted: this catches a bundle
+                // unpacked without modes, and an exact access(X_OK) check would need libc.
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
@@ -367,6 +369,22 @@ impl PgAccess {
     }
 
     ///
+    /// Atomically claim a retry after a peer's failed acquisition
+    ///
+    /// Check and insert happen under one lock so that exactly one waiter wins.
+    ///
+    async fn try_claim_acquisition(&self) -> bool {
+        let mut lock = ACQUIRED_PG_BINS.lock().await;
+        match lock.get(&self.cache_dir) {
+            None | Some(PgAcquisitionStatus::Undefined) => {
+                lock.insert(self.cache_dir.clone(), PgAcquisitionStatus::InProgress);
+                true
+            }
+            Some(_) => false,
+        }
+    }
+
+    ///
     /// Determine if postgresql binaries acquisition is needed
     ///
     pub async fn acquisition_needed(&self) -> PgResult<bool> {
@@ -382,13 +400,23 @@ impl PgAccess {
             match self.acquisition_status().await {
                 PgAcquisitionStatus::InProgress => {
                     let mut interval = interval(Duration::from_millis(100));
-                    while self.acquisition_status().await == PgAcquisitionStatus::InProgress {
-                        interval.tick().await;
+                    loop {
+                        while self.acquisition_status().await == PgAcquisitionStatus::InProgress {
+                            interval.tick().await;
+                        }
+                        if self.pg_executables_cached().await? {
+                            return Ok(false);
+                        }
+                        if self.acquisition_status().await == PgAcquisitionStatus::Finished {
+                            return Ok(false);
+                        }
+                        // The peer failed and reset the status. Every waiter wakes at once, so
+                        // only the one that claims the retry acquires; the others keep waiting
+                        // instead of racing it on the same zip file and cache directory.
+                        if self.try_claim_acquisition().await {
+                            return Ok(true);
+                        }
                     }
-                    // The peer may have failed and reset the status; acquiring again then
-                    // surfaces this instance's own error instead of running without binaries.
-                    // Two waiters may both retry, the same benign race as a first acquisition.
-                    Ok(!self.pg_executables_cached().await?)
                 }
                 PgAcquisitionStatus::Finished => Ok(false),
                 PgAcquisitionStatus::Undefined => Ok(true),
@@ -403,7 +431,7 @@ impl PgAccess {
     ///
     pub async fn write_pg_zip(&self, bytes: &[u8]) -> PgResult<()> {
         // In local mode cache_dir is the user's own installation; never drop a zip into it.
-        if self.local_binaries_dir.is_some() {
+        if self.uses_local_binaries() {
             return Err(PgEmbedError {
                 error_type: PgEmbedErrorType::InvalidPgPackage,
                 source: None,
@@ -763,22 +791,23 @@ mod tests {
         assert!(access.acquisition_status().await == PgAcquisitionStatus::Undefined);
     }
 
+    // A struct literal keyed by a temp dir: remote-mode `new` would touch the real cache.
+    fn access_for(dir: &Path) -> PgAccess {
+        PgAccess {
+            cache_dir: dir.to_path_buf(),
+            database_dir: dir.join("db"),
+            pg_ctl_exe: dir.join("bin").join("pg_ctl"),
+            init_db_exe: dir.join("bin").join("initdb"),
+            pw_file_path: dir.join("db.pwfile"),
+            zip_file_path: dir.join("binaries.zip"),
+            pg_version_file: dir.join("db").join("PG_VERSION"),
+            local_binaries_dir: None,
+        }
+    }
+
     // Regression: waiters used to hang forever when the peer's acquisition failed.
     #[tokio::test]
     async fn waiter_retries_after_peer_acquisition_failed() {
-        fn access_for(dir: &Path) -> PgAccess {
-            PgAccess {
-                cache_dir: dir.to_path_buf(),
-                database_dir: dir.join("db"),
-                pg_ctl_exe: dir.join("bin").join("pg_ctl"),
-                init_db_exe: dir.join("bin").join("initdb"),
-                pw_file_path: dir.join("db.pwfile"),
-                zip_file_path: dir.join("binaries.zip"),
-                pg_version_file: dir.join("db").join("PG_VERSION"),
-                local_binaries_dir: None,
-            }
-        }
-
         let temporary_directory = tempfile::tempdir().unwrap();
         let access = access_for(temporary_directory.path());
         access.mark_acquisition_in_progress().await.unwrap();
@@ -794,6 +823,48 @@ mod tests {
             .expect("waiter must stop waiting once the peer acquisition failed");
         peer_task.await.unwrap();
         assert!(needed.unwrap());
+        // The winning waiter holds the claim; release it so the static map is left clean.
+        access.mark_acquisition_failed().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn only_one_waiter_claims_retry_after_peer_failure() {
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let path = temporary_directory.path().to_path_buf();
+        access_for(&path)
+            .mark_acquisition_in_progress()
+            .await
+            .unwrap();
+
+        let waiter = |path: PathBuf| {
+            tokio::spawn(async move {
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    access_for(&path).acquisition_needed(),
+                )
+                .await
+            })
+        };
+        let first_waiter = waiter(path.clone());
+        let second_waiter = waiter(path.clone());
+
+        let failing_peer = access_for(&path);
+        let peer_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            failing_peer.mark_acquisition_failed().await.unwrap();
+        });
+
+        let results = vec![first_waiter.await.unwrap(), second_waiter.await.unwrap()];
+        peer_task.await.unwrap();
+        access_for(&path).mark_acquisition_failed().await.unwrap();
+
+        let claimed = results
+            .iter()
+            .filter(|result| matches!(result, Ok(Ok(true))))
+            .count();
+        let still_waiting = results.iter().filter(|result| result.is_err()).count();
+        assert_eq!(claimed, 1, "{:?}", results);
+        assert_eq!(still_waiting, 1, "{:?}", results);
     }
 
     #[test]

@@ -143,10 +143,6 @@ impl PgFetchSettings {
                     }
                 }
             }
-            let body_for_log = match body_read_error {
-                None => truncate_for_log(&body_prefix),
-                Some(error) => format!("<body unreadable: {}>", error),
-            };
             log::warn!(
                 "downloading PostgreSQL binaries from {} failed with HTTP status {}",
                 loggable_url,
@@ -162,6 +158,11 @@ impl PgFetchSettings {
                     body_prefix.len()
                 );
             } else {
+                // Built only here so a credentialed body never even becomes a string.
+                let body_for_log = match body_read_error {
+                    None => truncate_for_log(&body_prefix),
+                    Some(error) => format!("<body unreadable: {}>", error),
+                };
                 log::debug!(
                     "error response body from {}: {}",
                     loggable_url,
