@@ -68,8 +68,13 @@ impl PgAccess {
         if let Some(local_binaries_dir) = &fetch_settings.local_binaries_dir {
             Self::validate_local_binaries_dir(local_binaries_dir)?;
         }
-        // cache directory
-        let cache_dir = Self::create_cache_dir_structure(&fetch_settings).await?;
+        // Local mode never acquires, so it must not need (or populate) the user's real
+        // pg-embed cache, which is unavailable on hosts without a cache dir; the install
+        // directory is where the binaries live.
+        let cache_dir = match &fetch_settings.local_binaries_dir {
+            Some(local_binaries_dir) => local_binaries_dir.clone(),
+            None => Self::create_cache_dir_structure(&fetch_settings).await?,
+        };
         Self::create_db_dir_structure(database_dir).await?;
         // The executables come from the local installation when one is configured;
         // pg_executables_cached() then sees initdb and no download is attempted.
@@ -160,7 +165,7 @@ impl PgAccess {
             error_type: PgEmbedErrorType::InvalidPgPackage,
             source: None,
             message: Some(format!(
-                "local binaries directory {} is missing executables: {}",
+                "local binaries directory {} is missing required entries: {}",
                 dir.display(),
                 missing.join(", ")
             )),
@@ -297,6 +302,8 @@ impl PgAccess {
         // Downloading into the cache would not help: the executables are run from the
         // local directory, so a bundle that vanished after `new` must surface as an error.
         if let Some(local_binaries_dir) = &self.local_binaries_dir {
+            // The few blocking stat calls are deliberate: validate_local_binaries_dir is
+            // shared with the sync constructor path and their cost is negligible.
             Self::validate_local_binaries_dir(local_binaries_dir)?;
             return Ok(false);
         }
@@ -502,6 +509,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_mode_uses_installation_dir_instead_of_cache_dir() {
+        let installation = fake_installation(&[]);
+        let database = tempfile::tempdir().unwrap();
+        let access = PgAccess::new(
+            &local_settings(installation.path()),
+            &database.path().join("db"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(access.cache_dir, installation.path());
+    }
+
+    #[tokio::test]
     async fn missing_postgres_executable_is_reported() {
         let installation = fake_installation(&["postgres"]);
         let database = tempfile::tempdir().unwrap();
@@ -514,7 +534,7 @@ mod tests {
         .unwrap();
         assert_eq!(error.error_type, PgEmbedErrorType::InvalidPgPackage);
         let message = error.message.unwrap();
-        assert!(message.contains("postgres"), "{}", message);
+        assert!(message.contains("bin/postgres"), "{}", message);
         assert!(!message.contains("initdb"), "{}", message);
     }
 
