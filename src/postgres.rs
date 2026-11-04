@@ -525,7 +525,7 @@ mod tests {
         let cache_dir = temporary_directory.path().join("cache");
         std::fs::create_dir_all(&cache_dir).unwrap();
         // Accepts the request and never answers, so the download is still in flight when the
-        // timeout drops the future.
+        // acquisition future is dropped.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let (accepted_sender, mut accepted_receiver) = tokio::sync::oneshot::channel::<()>();
@@ -550,12 +550,26 @@ mod tests {
         pg.shutting_down = true;
         pg.pg_settings.persistent = true;
 
-        let outcome = tokio::time::timeout(Duration::from_millis(300), pg.acquire_postgres()).await;
-        assert!(outcome.is_err(), "the stalled download must time out");
-        assert!(
-            accepted_receiver.try_recv().is_ok(),
-            "the request must have reached the server before the cancellation"
-        );
+        // Cancelling on the server's accept signal, not after a fixed delay, guarantees the
+        // download is in flight when the future is dropped, however slow the test machine.
+        {
+            let acquire = pg.acquire_postgres();
+            tokio::pin!(acquire);
+            // Bounded so a broken test fails instead of hanging.
+            tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::select! {
+                    outcome = &mut acquire => {
+                        panic!("the stalled download must not complete: {:?}", outcome.err())
+                    }
+                    accepted = &mut accepted_receiver => {
+                        accepted.expect("the stalled server must signal the accepted request")
+                    }
+                }
+            })
+            .await
+            .expect("the request must reach the stalled server");
+            // Leaving this scope drops the pinned acquisition mid-download.
+        }
         // A contended status lock makes the guard reset through a spawned task, so poll.
         tokio::time::timeout(Duration::from_secs(2), async {
             while pg.pg_access.acquisition_status().await
