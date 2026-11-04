@@ -152,7 +152,11 @@ impl PgEmbed {
             });
         }
         self.pg_access.mark_acquisition_in_progress().await?;
-        match self.acquire_postgres_steps().await {
+        // The guard only covers cancellation (this future dropped mid-await). Completed runs,
+        // successful or failed, set the status explicitly below and then release it, so the
+        // reset happens once and failure keeps its awaited, error-reporting path.
+        let mut claim_guard = self.pg_access.acquisition_claim_guard();
+        let result = match self.acquire_postgres_steps().await {
             Ok(()) => Ok(()),
             Err(error) => {
                 // Other instances wait while the status is in progress; reset it so they
@@ -165,7 +169,9 @@ impl PgEmbed {
                 }
                 Err(error)
             }
-        }
+        };
+        claim_guard.release();
+        result
     }
 
     async fn acquire_postgres_steps(&self) -> PgResult<()> {

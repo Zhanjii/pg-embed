@@ -28,6 +28,50 @@ lazy_static! {
     Arc::new(Mutex::new(HashMap::with_capacity(5)));
 }
 
+///
+/// Resets a cache directory's acquisition status when dropped unreleased
+///
+/// A cancelled acquisition (e.g. a timeout around `setup()`) never reaches its explicit
+/// status update, and other instances for the same cache directory would wait forever.
+///
+pub(crate) struct AcquisitionClaimGuard {
+    cache_dir: PathBuf,
+    released: bool,
+}
+
+impl AcquisitionClaimGuard {
+    /// The acquisition reached its own status update, so Drop must not touch the status.
+    pub(crate) fn release(&mut self) {
+        self.released = true;
+    }
+}
+
+impl Drop for AcquisitionClaimGuard {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        // Drop cannot await and must not block a runtime thread, so the lock is only tried.
+        if let Ok(mut lock) = ACQUIRED_PG_BINS.try_lock() {
+            lock.remove(&self.cache_dir);
+            return;
+        }
+        let cache_dir = self.cache_dir.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    ACQUIRED_PG_BINS.lock().await.remove(&cache_dir);
+                });
+            }
+            Err(_) => log::warn!(
+                "could not reset the postgres acquisition status for {} after a cancelled acquisition; \
+                 other instances using this cache directory may wait forever",
+                cache_dir.display()
+            ),
+        }
+    }
+}
+
 const PG_EMBED_CACHE_DIR_NAME: &'static str = "pg-embed";
 const PG_VERSION_FILE_NAME: &'static str = "PG_VERSION";
 
@@ -203,11 +247,11 @@ impl PgAccess {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    let executable = std::fs::metadata(&path)
-                        .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
-                        .unwrap_or(false);
-                    if !executable {
-                        return Some(format!("{} (not executable)", relative));
+                    match std::fs::metadata(&path) {
+                        Ok(metadata) if metadata.permissions().mode() & 0o111 != 0 => {}
+                        Ok(_) => return Some(format!("{} (not executable)", relative)),
+                        // Distinct from "not executable": chmod would not fix an I/O error.
+                        Err(err) => return Some(format!("{} (unreadable: {})", relative, err)),
                     }
                 }
                 None
@@ -385,7 +429,21 @@ impl PgAccess {
     }
 
     ///
+    /// Guard that resets an in-progress acquisition status if the acquiring future is dropped
+    ///
+    pub(crate) fn acquisition_claim_guard(&self) -> AcquisitionClaimGuard {
+        AcquisitionClaimGuard {
+            cache_dir: self.cache_dir.clone(),
+            released: false,
+        }
+    }
+
+    ///
     /// Determine if postgresql binaries acquisition is needed
+    ///
+    /// Not a pure query: after a peer's failed acquisition, `true` means this instance now
+    /// holds the acquisition claim, which only acquiring (`PgEmbed::acquire_postgres`)
+    /// releases. Callers that do not then acquire leave other instances waiting forever.
     ///
     pub async fn acquisition_needed(&self) -> PgResult<bool> {
         // Downloading into the cache would not help: the executables are run from the
@@ -803,6 +861,35 @@ mod tests {
             pg_version_file: dir.join("db").join("PG_VERSION"),
             local_binaries_dir: None,
         }
+    }
+
+    #[tokio::test]
+    async fn unreleased_claim_guard_resets_status_on_drop() {
+        let cache = tempfile::tempdir().unwrap();
+        let access = access_for(cache.path());
+        access.mark_acquisition_in_progress().await.unwrap();
+        drop(access.acquisition_claim_guard());
+        // Parallel tests share the status map, so a contended try_lock falls back to a
+        // spawned reset; poll instead of asserting immediately.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while access.acquisition_status().await != PgAcquisitionStatus::Undefined {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("dropping an unreleased guard must reset the status");
+    }
+
+    #[tokio::test]
+    async fn released_claim_guard_leaves_status_unchanged() {
+        let cache = tempfile::tempdir().unwrap();
+        let access = access_for(cache.path());
+        access.mark_acquisition_in_progress().await.unwrap();
+        let mut guard = access.acquisition_claim_guard();
+        guard.release();
+        drop(guard);
+        assert!(access.acquisition_status().await == PgAcquisitionStatus::InProgress);
+        access.mark_acquisition_failed().await.unwrap();
     }
 
     // Regression: waiters used to hang forever when the peer's acquisition failed.
