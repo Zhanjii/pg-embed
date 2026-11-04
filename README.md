@@ -134,6 +134,10 @@ appended, so a mirror must serve this Maven layout under the base:
 
 `<host>/maven2/io/zonky/test/postgres/embedded-postgres-binaries-<platform>/<version>/embedded-postgres-binaries-<platform>-<version>.jar`
 
+Credentials in the host (`https://user:token@mirror`) are sent as basic auth. Only this userinfo part
+(`user:password@`) is redacted from logs and errors; tokens in the path or query string are logged as-is, so pass
+credentials as userinfo.
+
 A download that answers with a non-success HTTP status fails with `PgEmbedErrorType::DownloadFailure`, and its
 message names the url and the status.
 

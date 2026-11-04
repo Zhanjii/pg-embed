@@ -35,7 +35,8 @@ const PG_VERSION_FILE_NAME: &'static str = "PG_VERSION";
 /// Access to pg_ctl, initdb, database directory and cache directory
 ///
 pub struct PgAccess {
-    /// Cache directory path; in local mode, the local installation directory instead
+    /// Cache directory path; in local mode, the local installation directory instead.
+    /// In local mode this is the user's own installation: do not delete it or unpack into it.
     pub cache_dir: PathBuf,
     /// Database directory path
     pub database_dir: PathBuf,
@@ -45,7 +46,8 @@ pub struct PgAccess {
     pub init_db_exe: PathBuf,
     /// Password file path
     pub pw_file_path: PathBuf,
-    /// Postgresql binaries zip file path; unused (never written) in local mode
+    /// Postgresql binaries zip file path; in local mode it points into the user's own
+    /// installation and must never be written
     pub zip_file_path: PathBuf,
     /// Postgresql database version file
     /// used for internal checks
@@ -69,14 +71,20 @@ impl PgAccess {
         fetch_settings: &PgFetchSettings,
         database_dir: &PathBuf,
     ) -> Result<Self, PgEmbedError> {
+        // Resolved once so every derived executable path (including the Drop-time pg_ctl stop)
+        // is immune to later process cwd changes.
+        let local_binaries_dir = match &fetch_settings.local_binaries_dir {
+            Some(dir) => Some(Self::absolute_local_binaries_dir(dir)?),
+            None => None,
+        };
         // Validate before any directory is created so a bad path has no side effects.
-        if let Some(local_binaries_dir) = &fetch_settings.local_binaries_dir {
+        if let Some(local_binaries_dir) = &local_binaries_dir {
             Self::validate_local_binaries_dir(local_binaries_dir)?;
         }
         // Local mode never acquires, so it must not need (or populate) the user's real
         // pg-embed cache, which is unavailable on hosts without a cache dir; the install
         // directory is where the binaries live.
-        let cache_dir = match &fetch_settings.local_binaries_dir {
+        let cache_dir = match &local_binaries_dir {
             Some(local_binaries_dir) => local_binaries_dir.clone(),
             None => Self::create_cache_dir_structure(&fetch_settings).await?,
         };
@@ -85,7 +93,7 @@ impl PgAccess {
         // pg_executables_cached() then sees initdb and no download is attempted.
         // The exe suffix is included here (unlike the cache paths below) because
         // pg_executables_cached() opens the path as a file, which needs ".exe" on Windows.
-        let (pg_ctl, init_db) = match &fetch_settings.local_binaries_dir {
+        let (pg_ctl, init_db) = match &local_binaries_dir {
             Some(local_binaries_dir) => (
                 local_binaries_dir.join(format!("bin/pg_ctl{}", std::env::consts::EXE_SUFFIX)),
                 local_binaries_dir.join(format!("bin/initdb{}", std::env::consts::EXE_SUFFIX)),
@@ -120,8 +128,27 @@ impl PgAccess {
             pw_file_path: pw_file,
             zip_file_path,
             pg_version_file,
-            local_binaries_dir: fetch_settings.local_binaries_dir.clone(),
+            local_binaries_dir,
         })
+    }
+
+    ///
+    /// Make a user-supplied local binaries directory absolute
+    ///
+    fn absolute_local_binaries_dir(dir: &Path) -> PgResult<PathBuf> {
+        if dir.is_absolute() {
+            return Ok(dir.to_path_buf());
+        }
+        // Not fs::canonicalize: on Windows it yields \\?\ verbatim paths that pg_ctl and cmd handle badly.
+        let current_dir = std::env::current_dir().map_err(|e| PgEmbedError {
+            error_type: PgEmbedErrorType::InvalidPgPackage,
+            source: Some(Box::new(e)),
+            message: Some(format!(
+                "could not resolve relative local binaries directory {}",
+                dir.display()
+            )),
+        })?;
+        Ok(current_dir.join(dir))
     }
 
     ///
@@ -640,5 +667,19 @@ mod tests {
         .unwrap();
         assert_eq!(error.error_type, PgEmbedErrorType::InvalidPgPackage);
         assert!(error.message.unwrap().contains("does not exist"));
+    }
+
+    #[test]
+    fn relative_local_binaries_dir_is_made_absolute() {
+        let resolved = PgAccess::absolute_local_binaries_dir(Path::new("relative/bundle")).unwrap();
+        assert!(resolved.is_absolute());
+        assert!(resolved.ends_with("relative/bundle"));
+    }
+
+    #[test]
+    fn absolute_local_binaries_dir_is_unchanged() {
+        let installation = fake_installation(&[]);
+        let resolved = PgAccess::absolute_local_binaries_dir(installation.path()).unwrap();
+        assert_eq!(resolved, installation.path());
     }
 }
