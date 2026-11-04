@@ -9,6 +9,7 @@ ___
 
 ### Breaking Changes
 - `PgFetchSettings` has a new public field `local_binaries_dir`; struct literals that list every field must add `local_binaries_dir: None` (literals using `..Default::default()` are unaffected)
+- In local mode (`local_binaries_dir` set) the public `PgAccess.cache_dir` is the local installation directory and `zip_file_path` points into it (never written); code that drives acquisition or cleanup by hand with these fields must check for local mode first (`acquire_postgres` and `write_pg_zip` already refuse)
 
 # v0.6.5
 ___

@@ -504,6 +504,13 @@ pub(crate) fn fake_installation(omit: &[&str]) -> tempfile::TempDir {
 mod tests {
     use super::*;
 
+    fn local_settings(dir: &Path) -> PgFetchSettings {
+        PgFetchSettings {
+            local_binaries_dir: Some(dir.to_path_buf()),
+            ..Default::default()
+        }
+    }
+
     #[tokio::test]
     async fn write_pg_zip_is_refused_in_local_mode() {
         let installation = fake_installation(&[]);
@@ -522,13 +529,6 @@ mod tests {
             .filter(|entry| entry.path().extension() == Some(std::ffi::OsStr::new("zip")))
             .count();
         assert_eq!(zip_files, 0);
-    }
-
-    fn local_settings(dir: &Path) -> PgFetchSettings {
-        PgFetchSettings {
-            local_binaries_dir: Some(dir.to_path_buf()),
-            ..Default::default()
-        }
     }
 
     #[tokio::test]

@@ -144,6 +144,9 @@ of the same major version as `version`. It must be a complete installation tree 
 must contain `initdb`, `pg_ctl` and `postgres`, and `share/` must exist (only `bin/` and `share/` are checked).
 pg-embed then runs those executables, never downloads and uses no cache directory. `PgEmbed::new` fails with
 `PgEmbedErrorType::InvalidPgPackage` if the directory, any of the executables or `share/` is missing.
+`share/` must sit inside the same directory as `bin/` (as in the zonky/EDB bundles); split distro layouts such as
+Debian/Ubuntu (`/usr/lib/postgresql/15/bin` with `/usr/share/postgresql/15`) are rejected. Copy or symlink them into
+one tree, or use the download path.
 
  ```rust
  let fetch_settings = PgFetchSettings {
