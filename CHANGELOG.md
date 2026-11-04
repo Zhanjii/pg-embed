@@ -7,6 +7,9 @@ ___
 ### Fix
 - A download answering with a non-success HTTP status now fails with `DownloadFailure` naming the url and status, instead of unpacking the error page as a zip
 
+### Breaking Changes
+- `PgFetchSettings` has a new public field `local_binaries_dir`; struct literals that list every field must add `local_binaries_dir: None` (literals using `..Default::default()` are unaffected)
+
 # v0.6.5
 ___
 ### Fix

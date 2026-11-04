@@ -139,9 +139,10 @@ message names the url and the status.
 ### Using an existing installation
 
 Set `PgFetchSettings.local_binaries_dir` (default `None`) to the directory of an existing PostgreSQL installation
-of the same major version as `version`. Its `bin/` must contain `initdb`, `pg_ctl` and `postgres`. pg-embed then
-runs those executables and never downloads. `PgEmbed::new` fails with `PgEmbedErrorType::InvalidPgPackage` if the
-directory or any of the executables is missing.
+of the same major version as `version`. It must be a complete installation tree (`bin/`, `lib/`, `share/`); `bin/`
+must contain `initdb`, `pg_ctl` and `postgres`, and `share/` must exist (only `bin/` and `share/` are checked).
+pg-embed then runs those executables and never downloads. `PgEmbed::new` fails with
+`PgEmbedErrorType::InvalidPgPackage` if the directory, any of the executables or `share/` is missing.
 
  ```rust
  let fetch_settings = PgFetchSettings {

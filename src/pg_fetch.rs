@@ -31,6 +31,9 @@ pub const PG_V10: PostgresVersion = PostgresVersion("10.23.0");
 /// Latest postgres version 9
 pub const PG_V9: PostgresVersion = PostgresVersion("9.6.24");
 
+/// Maximum number of bytes of an error response body that is logged
+const MAX_LOGGED_BODY_BYTES: usize = 512;
+
 /// Settings that determine the postgres binary to be fetched
 pub struct PgFetchSettings {
     /// The repository host
@@ -47,8 +50,10 @@ pub struct PgFetchSettings {
     pub architecture: Architecture,
     /// The postgresql version
     pub version: PostgresVersion,
-    /// Directory of an existing postgresql installation whose `bin/` holds
-    /// `initdb`, `pg_ctl` and `postgres`
+    /// Directory of a complete existing postgresql installation (`bin/`, `lib/`, `share/`)
+    ///
+    /// `bin/` must hold `initdb`, `pg_ctl` and `postgres`, and `share/` must exist;
+    /// only `bin/` and `share/` are checked.
     ///
     /// Must be the same major version as `version`; this is not checked.
     /// When set, pg-embed never downloads binaries and uses these executables instead.
@@ -166,9 +171,6 @@ impl PgFetchSettings {
         Ok(Box::new(content))
     }
 }
-
-/// Maximum number of bytes of an error response body that is logged
-const MAX_LOGGED_BODY_BYTES: usize = 512;
 
 /// Strip basic-auth credentials from a url so it is safe to log or embed in an error
 fn redact_url_credentials(url: &str) -> String {

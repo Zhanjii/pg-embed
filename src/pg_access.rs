@@ -116,10 +116,23 @@ impl PgAccess {
 
     ///
     /// Check that a local postgresql installation contains the executables pg-embed runs
+    /// and the `share/` directory initdb needs
     ///
-    /// Reports every missing executable at once so the caller can fix them in one go.
+    /// Reports everything missing at once so the caller can fix it in one go.
     ///
     fn validate_local_binaries_dir(dir: &Path) -> PgResult<()> {
+        // stop_db_command_sync runs from Drop and unwraps the pg_ctl path to a str,
+        // so a non-UTF-8 user-supplied path would panic there.
+        if dir.to_str().is_none() {
+            return Err(PgEmbedError {
+                error_type: PgEmbedErrorType::InvalidPgPackage,
+                source: None,
+                message: Some(format!(
+                    "local binaries directory {} must be a valid UTF-8 path",
+                    dir.display()
+                )),
+            });
+        }
         if !dir.is_dir() {
             return Err(PgEmbedError {
                 error_type: PgEmbedErrorType::InvalidPgPackage,
@@ -130,11 +143,16 @@ impl PgAccess {
                 )),
             });
         }
-        let missing: Vec<String> = ["initdb", "pg_ctl", "postgres"]
+        let mut missing: Vec<String> = ["initdb", "pg_ctl", "postgres"]
             .iter()
             .map(|name| format!("bin/{}{}", name, std::env::consts::EXE_SUFFIX))
             .filter(|relative| !dir.join(relative).is_file())
             .collect();
+        // initdb reads its template files from share/; the layout inside differs
+        // between distributions, so only the directory itself is checked.
+        if !dir.join("share").is_dir() {
+            missing.push("share/".to_string());
+        }
         if missing.is_empty() {
             return Ok(());
         }
@@ -442,6 +460,9 @@ mod tests {
         let installation = tempfile::tempdir().unwrap();
         let bin_dir = installation.path().join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
+        if !omit.contains(&"share") {
+            std::fs::create_dir_all(installation.path().join("share")).unwrap();
+        }
         for name in ["initdb", "pg_ctl", "postgres"] {
             if omit.contains(&name) {
                 continue;
@@ -526,6 +547,26 @@ mod tests {
             .unwrap();
         assert!(message.contains("initdb"), "{}", message);
         assert!(message.contains("pg_ctl"), "{}", message);
+    }
+
+    #[test]
+    fn missing_share_directory_is_reported() {
+        let installation = fake_installation(&["share"]);
+        let error = PgAccess::validate_local_binaries_dir(installation.path()).unwrap_err();
+        assert_eq!(error.error_type, PgEmbedErrorType::InvalidPgPackage);
+        let message = error.message.unwrap();
+        assert!(message.contains("share"), "{}", message);
+        assert!(!message.contains("initdb"), "{}", message);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_local_binaries_dir_is_rejected() {
+        use std::os::unix::ffi::OsStrExt;
+        let path = Path::new(std::ffi::OsStr::from_bytes(b"/tmp/\xff"));
+        let error = PgAccess::validate_local_binaries_dir(path).unwrap_err();
+        assert_eq!(error.error_type, PgEmbedErrorType::InvalidPgPackage);
+        assert!(error.message.unwrap().contains("UTF-8"));
     }
 
     #[tokio::test]
