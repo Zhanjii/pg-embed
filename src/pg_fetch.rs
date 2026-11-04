@@ -152,13 +152,22 @@ impl PgFetchSettings {
                 loggable_url,
                 status
             );
-            // Debug only: some proxies (Artifactory, Nexus) echo request headers in error pages,
-            // which would include the Authorization header built from credentials in `host`.
-            log::debug!(
-                "error response body from {}: {}",
-                loggable_url,
-                body_for_log
-            );
+            // Some proxies (Artifactory, Nexus) echo request headers in error pages, which
+            // would include the Authorization header built from credentials in `host`, so the
+            // body is never logged for a credentialed request, not even at debug.
+            if url_has_credentials(&download_url) {
+                log::debug!(
+                    "error response body from {} withheld because the request carried credentials, {} bytes",
+                    loggable_url,
+                    body_prefix.len()
+                );
+            } else {
+                log::debug!(
+                    "error response body from {}: {}",
+                    loggable_url,
+                    body_for_log
+                );
+            }
             return Err(PgEmbedError {
                 error_type: PgEmbedErrorType::DownloadFailure,
                 source: None,
@@ -198,6 +207,16 @@ fn redact_url_credentials(url: &str) -> String {
         }
         // An unparseable url may still embed credentials; reqwest fails on it too and its error source is attached.
         Err(_) => "<unparseable download url>".to_string(),
+    }
+}
+
+/// Whether a url carries basic-auth userinfo, i.e. the request sends an Authorization header
+fn url_has_credentials(url: &str) -> bool {
+    match reqwest::Url::parse(url) {
+        Ok(parsed) => !parsed.username().is_empty() || parsed.password().is_some(),
+        // Callers use this to decide whether logging is safe; an unparseable url may still
+        // embed credentials, so it is treated as credentialed.
+        Err(_) => true,
     }
 }
 
@@ -336,6 +355,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn url_has_credentials_detects_userinfo() {
+        assert!(url_has_credentials(
+            "https://user:secret@mirror.internal/x.jar"
+        ));
+        assert!(url_has_credentials("https://user@mirror.internal/x.jar"));
+        assert!(url_has_credentials("https://:secret@mirror.internal/x.jar"));
+    }
+
+    #[test]
+    fn url_has_credentials_is_false_without_userinfo() {
+        assert!(!url_has_credentials("https://mirror.internal/x.jar"));
+    }
+
+    #[test]
+    fn url_has_credentials_treats_unparseable_url_as_credentialed() {
+        assert!(url_has_credentials("not a url user:secret@"));
+    }
+
     #[tokio::test]
     async fn fetch_postgres_error_does_not_leak_host_credentials() {
         let host = serve_once("404 Not Found", b"nope".to_vec()).await;
@@ -352,9 +390,16 @@ mod tests {
     async fn fetch_postgres_transport_error_does_not_leak_host_credentials() {
         // The error source is the raw reqwest error; this pins that reqwest keeps stripping
         // userinfo from its own url so an upgrade cannot silently start leaking credentials.
+        // The listener stays bound (a freed port could be reused by a parallel test) and the
+        // connection is closed without a response, which reqwest reports as a transport error.
+        // reqwest's default client honours HTTP_PROXY/HTTPS_PROXY; set NO_PROXY=127.0.0.1 if
+        // this test fails behind a proxy.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            drop(socket);
+        });
         let settings = fixed_settings(&format!("http://user:secret@127.0.0.1:{}", port));
         let error = settings.fetch_postgres().await.unwrap_err();
         assert_eq!(error.error_type, PgEmbedErrorType::DownloadFailure);

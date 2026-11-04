@@ -10,7 +10,6 @@ src/pg_access.rs: warning: redundant pattern matching
 src/pg_access.rs: warning: redundant reference in `format!` argument: help: remove the redundant `&`: `fetch_settings.version.0`
 src/pg_access.rs: warning: the borrowed expression implements the required traits: help: change this to: `["stop", "-w", "-D", database_dir.to_str().unwrap()]`
 src/pg_access.rs: warning: this expression creates a reference which is immediately dereferenced by the compiler: help: change this to: `bytes`
-src/pg_access.rs: warning: this expression creates a reference which is immediately dereferenced by the compiler: help: change this to: `fetch_settings`
 src/pg_access.rs: warning: writing `&PathBuf` instead of `&Path` involves a new object where a slice will do
 src/pg_access.rs: warning: writing `&PathBuf` instead of `&Path` involves a new object where a slice will do
 src/pg_commands.rs: warning: writing `&PathBuf` instead of `&Path` involves a new object where a slice will do
