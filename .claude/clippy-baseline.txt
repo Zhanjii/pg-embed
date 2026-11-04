@@ -1,0 +1,69 @@
+src/command_executor.rs: warning: field `command` is never read
+src/command_executor.rs: warning: non-binding `let` on a future
+src/command_executor.rs: warning: non-binding `let` on a future
+src/command_executor.rs: warning: non-binding `let` on a future
+src/pg_access.rs: warning: `if let .. else` expression looks like `matches!` macro
+src/pg_access.rs: warning: constants have by default a `'static` lifetime
+src/pg_access.rs: warning: constants have by default a `'static` lifetime
+src/pg_access.rs: warning: redundant pattern matching
+src/pg_access.rs: warning: redundant pattern matching
+src/pg_access.rs: warning: redundant reference in `format!` argument: help: remove the redundant `&`: `fetch_settings.version.0`
+src/pg_access.rs: warning: the borrowed expression implements the required traits: help: change this to: `["stop", "-w", "-D", database_dir.to_str().unwrap()]`
+src/pg_access.rs: warning: this expression creates a reference which is immediately dereferenced by the compiler: help: change this to: `bytes`
+src/pg_access.rs: warning: this expression creates a reference which is immediately dereferenced by the compiler: help: change this to: `fetch_settings`
+src/pg_access.rs: warning: writing `&PathBuf` instead of `&Path` involves a new object where a slice will do
+src/pg_access.rs: warning: writing `&PathBuf` instead of `&Path` involves a new object where a slice will do
+src/pg_commands.rs: warning: writing `&PathBuf` instead of `&Path` involves a new object where a slice will do
+src/pg_commands.rs: warning: writing `&PathBuf` instead of `&Path` involves a new object where a slice will do
+src/pg_commands.rs: warning: writing `&PathBuf` instead of `&Path` involves a new object where a slice will do
+src/pg_commands.rs: warning: writing `&PathBuf` instead of `&Path` involves a new object where a slice will do
+src/pg_commands.rs: warning: writing `&PathBuf` instead of `&Path` involves a new object where a slice will do
+src/pg_commands.rs: warning: writing `&PathBuf` instead of `&Path` involves a new object where a slice will do
+src/pg_commands.rs: warning: writing `&PathBuf` instead of `&Path` involves a new object where a slice will do
+src/pg_enums.rs: warning: direct implementation of `ToString`
+src/pg_enums.rs: warning: direct implementation of `ToString`
+src/pg_enums.rs: warning: direct implementation of `ToString`
+src/pg_enums.rs: warning: this `impl` can be derived
+src/pg_enums.rs: warning: this `impl` can be derived
+src/pg_fetch.rs: warning: redundant reference in `format!` argument: help: remove the redundant `&`: `platform`
+src/pg_fetch.rs: warning: redundant reference in `format!` argument: help: remove the redundant `&`: `platform`
+src/pg_fetch.rs: warning: redundant reference in `format!` argument: help: remove the redundant `&`: `self.host`
+src/pg_unpack.rs: warning: this expression creates a reference which is immediately dereferenced by the compiler: help: change this to: `cache_dir`
+src/pg_unpack.rs: warning: this expression creates a reference which is immediately dereferenced by the compiler: help: change this to: `cache_dir`
+src/pg_unpack.rs: warning: this expression creates a reference which is immediately dereferenced by the compiler: help: change this to: `file_path.as_path()`
+src/pg_unpack.rs: warning: this expression creates a reference which is immediately dereferenced by the compiler: help: change this to: `target_path.as_path()`
+src/pg_unpack.rs: warning: this expression creates a reference which is immediately dereferenced by the compiler: help: change this to: `target_path.as_path()`
+src/pg_unpack.rs: warning: this expression creates a reference which is immediately dereferenced by the compiler: help: change this to: `zip_file_path`
+src/pg_unpack.rs: warning: writing `&PathBuf` instead of `&Path` involves a new object where a slice will do
+src/pg_unpack.rs: warning: writing `&PathBuf` instead of `&Path` involves a new object where a slice will do
+src/pg_unpack.rs: warning: writing `&PathBuf` instead of `&Path` involves a new object where a slice will do
+src/pg_unpack.rs: warning: writing `&PathBuf` instead of `&Path` involves a new object where a slice will do
+src/pg_unpack.rs: warning: writing `&PathBuf` instead of `&Path` involves a new object where a slice will do
+src/postgres.rs: warning: `to_string` applied to a type that implements `Display` in `format!` args: help: remove this
+src/postgres.rs: warning: redundant reference in `format!` argument: help: remove the redundant `&`: `password`
+src/postgres.rs: warning: redundant reference in `format!` argument: help: remove the redundant `&`: `pg_settings.user`
+src/postgres.rs: warning: redundant reference in `format!` argument: help: remove the redundant `&`: `self.db_uri`
+src/postgres.rs: warning: this expression creates a reference which is immediately dereferenced by the compiler: help: change this to: `pg_bin_data`
+src/postgres.rs: warning: unnecessary operation: help: statement can be reduced to: `self.init_db().await?;`
+src/postgres.rs: warning: unused borrow that must be used: the borrow produces a value
+tests/migration_tokio.rs: warning: this expression creates a reference which is immediately dereferenced by the compiler: help: change this to: `db_name`
+tests/migration_tokio.rs: warning: this expression creates a reference which is immediately dereferenced by the compiler: help: change this to: `db_name`
+tests/migration_tokio.rs: warning: this expression creates a reference which is immediately dereferenced by the compiler: help: change this to: `db_name`
+tests/migration_tokio.rs: warning: this expression creates a reference which is immediately dereferenced by the compiler: help: change this to: `db_name`
+tests/migration_tokio.rs: warning: this expression creates a reference which is immediately dereferenced by the compiler: help: change this to: `db_name`
+tests/migration_tokio.rs: warning: this expression creates a reference which is immediately dereferenced by the compiler: help: change this to: `db_name`
+tests/migration_tokio.rs: warning: this expression creates a reference which is immediately dereferenced by the compiler: help: change this to: `db_name`
+tests/migration_tokio.rs: warning: this expression creates a reference which is immediately dereferenced by the compiler: help: change this to: `db_name`
+tests/migration_tokio.rs: warning: this expression creates a reference which is immediately dereferenced by the compiler: help: change this to: `db_name`
+tests/migration_tokio.rs: warning: used `assert_eq!` with a literal bool
+tests/migration_tokio.rs: warning: used `assert_eq!` with a literal bool
+tests/postgres_tokio.rs: warning: called `map(..).flatten()` on `Option`: help: try replacing `map` with `and_then` and remove the `.flatten()`: `and_then(|e| e.message)`
+tests/postgres_tokio.rs: warning: unused import: `PgEmbedErrorType`
+tests/postgres_tokio.rs: warning: used `assert_eq!` with a literal bool
+tests/postgres_tokio.rs: warning: used `assert_eq!` with a literal bool
+tests/postgres_tokio.rs: warning: used `assert_eq!` with a literal bool
+tests/postgres_tokio.rs: warning: used `assert_eq!` with a literal bool
+tests/postgres_tokio.rs: warning: used `assert_eq!` with a literal bool
+tests/postgres_tokio.rs: warning: used `assert_eq!` with a literal bool
+tests/postgres_tokio.rs: warning: used `assert_eq!` with a literal bool
+tests/postgres_tokio.rs: warning: variable does not need to be mutable
