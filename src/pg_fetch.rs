@@ -5,6 +5,7 @@
 //!
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures::TryFutureExt;
@@ -36,6 +37,17 @@ pub const PG_V9: PostgresVersion = PostgresVersion("9.6.24");
 /// 512 is enough of an HTML error page to diagnose a bad mirror, while bounding
 /// what is buffered and logged.
 const MAX_LOGGED_BODY_BYTES: usize = 512;
+
+/// How long the error response body may take to arrive before it is given up on
+///
+/// The body is only read for the log, so a mirror that sends an error status and then
+/// stalls the body must not delay the status error. 5 seconds is ample for 512 bytes
+/// from a responsive mirror.
+#[cfg(not(test))]
+const ERROR_BODY_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// Shortened in tests so the stalled-body test does not wait the production 5 seconds.
+#[cfg(test)]
+const ERROR_BODY_READ_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// Settings that determine the postgres binary to be fetched
 pub struct PgFetchSettings {
@@ -135,17 +147,18 @@ impl PgFetchSettings {
             // The body is only read for the log; failing to read it must not hide the status error.
             // Reading stops at the log limit so a huge error page is not buffered.
             let mut body_prefix: Vec<u8> = Vec::new();
-            let mut body_read_error: Option<reqwest::Error> = None;
-            while body_prefix.len() < MAX_LOGGED_BODY_BYTES {
-                match response.chunk().await {
-                    Ok(Some(chunk)) => body_prefix.extend_from_slice(&chunk),
-                    Ok(None) => break,
-                    Err(error) => {
-                        body_read_error = Some(error);
-                        break;
+            // Outer Err: the read timed out; inner Some: the read failed.
+            let body_read_outcome = tokio::time::timeout(ERROR_BODY_READ_TIMEOUT, async {
+                while body_prefix.len() < MAX_LOGGED_BODY_BYTES {
+                    match response.chunk().await {
+                        Ok(Some(chunk)) => body_prefix.extend_from_slice(&chunk),
+                        Ok(None) => break,
+                        Err(error) => return Some(error),
                     }
                 }
-            }
+                None
+            })
+            .await;
             log::warn!(
                 "downloading PostgreSQL binaries from {} failed with HTTP status {}",
                 loggable_url,
@@ -162,14 +175,19 @@ impl PgFetchSettings {
                 );
             } else {
                 // Built only here so a credentialed body never even becomes a string.
-                let body_for_log = match body_read_error {
-                    None => truncate_for_log(&body_prefix),
+                let body_for_log = match body_read_outcome {
+                    Ok(None) => truncate_for_log(&body_prefix),
                     // The bytes read before the failure still help diagnose the error page.
-                    Some(error) => format!(
+                    Ok(Some(error)) => format!(
                         "{} <body read failed after {} bytes: {}>",
                         truncate_for_log(&body_prefix),
                         body_prefix.len(),
                         error
+                    ),
+                    Err(_) => format!(
+                        "{} <body read timed out after {} bytes>",
+                        truncate_for_log(&body_prefix),
+                        body_prefix.len()
                     ),
                 };
                 // Debug, not warn, on purpose: mirror error pages can echo request headers (see above).
@@ -425,6 +443,45 @@ mod tests {
         let message = error.message.unwrap();
         assert!(message.contains(&settings.download_url()), "{}", message);
         assert!(message.contains("500"), "{}", message);
+    }
+
+    #[tokio::test]
+    async fn fetch_postgres_returns_status_error_when_error_body_stalls() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // Promises a large body, sends a few bytes of it, then holds the connection open
+        // without sending more, like a mirror that stalls after the status line.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stalled_server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = socket.read(&mut buffer).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            socket
+                .write_all(
+                    b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 1000000\r\n\r\npartial",
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(socket);
+        });
+        let settings = fixed_settings(&format!("http://127.0.0.1:{}", port));
+        // Bounded well above ERROR_BODY_READ_TIMEOUT so a regression fails instead of hanging.
+        let error = tokio::time::timeout(Duration::from_secs(10), settings.fetch_postgres())
+            .await
+            .expect("a stalled error body must not delay the status error")
+            .unwrap_err();
+        assert_eq!(error.error_type, PgEmbedErrorType::DownloadFailure);
+        let message = error.message.unwrap();
+        assert!(message.contains("500"), "{}", message);
+        stalled_server.abort();
     }
 
     #[tokio::test]
