@@ -128,8 +128,9 @@ The downloaded postgresql binaries are cached in the following directories:
 
 ### Download mirror
 
-`PgFetchSettings.host` (default `https://repo1.maven.org`) sets where the binaries are downloaded from. A mirror
-must serve the same Maven layout, because only the host part of the url is configurable:
+`PgFetchSettings.host` (default `https://repo1.maven.org`) is the repository base url (scheme, host and optional
+path prefix, e.g. `https://artifactory.example.com/artifactory/maven-remote`). `/maven2/io/zonky/...` is always
+appended, so a mirror must serve this Maven layout under the base:
 
 `<host>/maven2/io/zonky/test/postgres/embedded-postgres-binaries-<platform>/<version>/embedded-postgres-binaries-<platform>-<version>.jar`
 
@@ -141,7 +142,7 @@ message names the url and the status.
 Set `PgFetchSettings.local_binaries_dir` (default `None`) to the directory of an existing PostgreSQL installation
 of the same major version as `version`. It must be a complete installation tree (`bin/`, `lib/`, `share/`); `bin/`
 must contain `initdb`, `pg_ctl` and `postgres`, and `share/` must exist (only `bin/` and `share/` are checked).
-pg-embed then runs those executables and never downloads. `PgEmbed::new` fails with
+pg-embed then runs those executables, never downloads and uses no cache directory. `PgEmbed::new` fails with
 `PgEmbedErrorType::InvalidPgPackage` if the directory, any of the executables or `share/` is missing.
 
  ```rust

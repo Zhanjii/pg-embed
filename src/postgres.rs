@@ -136,6 +136,19 @@ impl PgEmbed {
     /// Download and unpack postgres binaries
     ///
     pub async fn acquire_postgres(&self) -> PgResult<()> {
+        // In local mode cache_dir is the user's own installation; downloading would write
+        // a zip into it and unpack over it, so refuse before touching anything.
+        if self.fetch_settings.local_binaries_dir.is_some() {
+            return Err(PgEmbedError {
+                error_type: PgEmbedErrorType::InvalidPgPackage,
+                source: None,
+                message: Some(
+                    "acquire_postgres is not available when local_binaries_dir is set; \
+                     pg-embed never downloads in local mode"
+                        .to_string(),
+                ),
+            });
+        }
         self.pg_access.mark_acquisition_in_progress().await?;
         let pg_bin_data = &self.fetch_settings.fetch_postgres().await?;
         self.pg_access.write_pg_zip(&pg_bin_data).await?;
@@ -374,8 +387,7 @@ mod tests {
             version: PG_V15,
             ..Default::default()
         };
-        let database = tempfile::tempdir().unwrap();
-        let pg_settings = settings_for(database.path().join("db"));
+        let pg_settings = settings_for(PathBuf::from("unused"));
         assert!(fetch_settings.local_binaries_dir.is_none());
         assert_eq!(fetch_settings.host, "https://repo1.maven.org");
         assert!(pg_settings.persistent);
@@ -410,5 +422,39 @@ mod tests {
         assert!(!pg.pg_access.acquisition_needed().await.unwrap());
         assert!(pg.pg_access.pg_ctl_exe.starts_with(installation.path()));
         assert!(pg.pg_access.init_db_exe.starts_with(installation.path()));
+    }
+
+    #[tokio::test]
+    async fn acquire_postgres_is_refused_in_local_mode() {
+        let installation = tempfile::tempdir().unwrap();
+        let bin_dir = installation.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::create_dir_all(installation.path().join("share")).unwrap();
+        for name in ["initdb", "pg_ctl", "postgres"] {
+            std::fs::write(
+                bin_dir.join(format!("{}{}", name, std::env::consts::EXE_SUFFIX)),
+                b"",
+            )
+            .unwrap();
+        }
+        let database = tempfile::tempdir().unwrap();
+        let mut pg = PgEmbed::new(
+            settings_for(database.path().join("db")),
+            PgFetchSettings {
+                local_binaries_dir: Some(installation.path().to_path_buf()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        pg.shutting_down = true;
+        let error = pg.acquire_postgres().await.unwrap_err();
+        assert_eq!(error.error_type, PgEmbedErrorType::InvalidPgPackage);
+        let zip_files = std::fs::read_dir(installation.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().extension() == Some(std::ffi::OsStr::new("zip")))
+            .count();
+        assert_eq!(zip_files, 0);
     }
 }

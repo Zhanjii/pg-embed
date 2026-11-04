@@ -36,11 +36,12 @@ const MAX_LOGGED_BODY_BYTES: usize = 512;
 
 /// Settings that determine the postgres binary to be fetched
 pub struct PgFetchSettings {
-    /// The repository host
+    /// The repository base url (scheme, host and optional path prefix, e.g.
+    /// `https://artifactory.example.com/artifactory/maven-remote`)
     ///
-    /// A mirror must serve the Maven layout
-    /// `<host>/maven2/io/zonky/test/postgres/embedded-postgres-binaries-<platform>/<version>/embedded-postgres-binaries-<platform>-<version>.jar`,
-    /// because only the host part of the download url is configurable.
+    /// `/maven2/io/zonky/...` is always appended, so a mirror must serve the Maven layout
+    /// `<host>/maven2/io/zonky/test/postgres/embedded-postgres-binaries-<platform>/<version>/embedded-postgres-binaries-<platform>-<version>.jar`
+    /// under that base.
     /// Credentials in the host (`https://user:token@mirror`) are sent as basic auth
     /// but redacted from logs and errors.
     pub host: String,
@@ -247,6 +248,14 @@ mod tests {
         let download_url = settings.download_url();
         assert!(!download_url.contains("//maven2"));
         assert!(download_url.starts_with("https://mirror.example.com/maven2/"));
+    }
+
+    #[test]
+    fn download_url_keeps_path_prefix_of_host() {
+        let settings = fixed_settings("https://artifactory.example.com/artifactory/maven-remote/");
+        assert!(settings.download_url().starts_with(
+            "https://artifactory.example.com/artifactory/maven-remote/maven2/io/zonky/"
+        ));
     }
 
     #[test]
