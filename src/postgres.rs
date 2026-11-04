@@ -135,6 +135,10 @@ impl PgEmbed {
     ///
     /// Download and unpack postgres binaries
     ///
+    /// Returns `InvalidPgPackage` when `local_binaries_dir` is set: local mode never downloads.
+    /// Marks the acquisition finished on success and resets it on failure or cancellation,
+    /// which also releases a retry claim handed over by `PgAccess::acquisition_needed`.
+    ///
     pub async fn acquire_postgres(&self) -> PgResult<()> {
         // In local mode cache_dir is the user's own installation; downloading would write
         // a zip into it and unpack over it, so refuse before touching anything. Guard on

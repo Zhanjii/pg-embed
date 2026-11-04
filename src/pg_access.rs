@@ -514,6 +514,9 @@ impl PgAccess {
     ///
     /// Determine if postgresql binaries acquisition is needed
     ///
+    /// In local mode it is never needed; the directory is re-validated instead, so a bundle
+    /// that disappeared after construction returns `InvalidPgPackage`.
+    ///
     /// Not a pure query: after a peer's failed acquisition, `true` means this instance now
     /// holds the acquisition claim, which only acquiring (`PgEmbed::acquire_postgres`)
     /// releases. Callers that do not then acquire leave other instances waiting forever.
@@ -559,6 +562,9 @@ impl PgAccess {
 
     ///
     /// Write pg binaries zip to postgresql cache directory
+    ///
+    /// Returns `InvalidPgPackage` in local mode, where the cache directory is the user's own
+    /// installation.
     ///
     pub async fn write_pg_zip(&self, bytes: &[u8]) -> PgResult<()> {
         // In local mode cache_dir is the user's own installation; never drop a zip into it.
