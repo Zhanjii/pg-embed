@@ -6,10 +6,12 @@ ___
 
 ### Fix
 - A download answering with a non-success HTTP status now fails with `DownloadFailure` naming the url and status, instead of unpacking the error page as a zip
+- A failed or cancelled binaries acquisition no longer leaves its status "in progress", which made every other `PgEmbed` for the same cache directory in the process wait forever; after a failure exactly one waiter retries
 
 ### Breaking Changes
 - `PgFetchSettings` has a new public field `local_binaries_dir`; struct literals that list every field must add `local_binaries_dir: None` (literals using `..Default::default()` are unaffected)
 - In local mode (`local_binaries_dir` set) the public `PgAccess.cache_dir` is the local installation directory and `zip_file_path` points into it (never written); code that drives acquisition or cleanup by hand with these fields must check for local mode first (`acquire_postgres` and `write_pg_zip` already refuse)
+- `PgAccess::acquisition_needed()` is no longer a pure query after a peer's failed acquisition: a `true` result can mean this instance now holds the retry claim, which only `PgEmbed::acquire_postgres` releases. Callers that drive acquisition by hand must acquire after a `true` result, or other instances on the same cache directory keep waiting
 
 # v0.6.5
 ___

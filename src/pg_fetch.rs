@@ -94,6 +94,9 @@ impl PgFetchSettings {
     ///
     /// The url the postgres binaries are downloaded from
     ///
+    /// The url is returned raw, including any `user:password@` credentials carried in
+    /// `host`, so callers must not log it. The crate itself only logs a redacted form.
+    ///
     pub fn download_url(&self) -> String {
         let platform = self.platform();
         let version = self.version.0;
@@ -161,7 +164,13 @@ impl PgFetchSettings {
                 // Built only here so a credentialed body never even becomes a string.
                 let body_for_log = match body_read_error {
                     None => truncate_for_log(&body_prefix),
-                    Some(error) => format!("<body unreadable: {}>", error),
+                    // The bytes read before the failure still help diagnose the error page.
+                    Some(error) => format!(
+                        "{} <body read failed after {} bytes: {}>",
+                        truncate_for_log(&body_prefix),
+                        body_prefix.len(),
+                        error
+                    ),
                 };
                 log::debug!(
                     "error response body from {}: {}",
