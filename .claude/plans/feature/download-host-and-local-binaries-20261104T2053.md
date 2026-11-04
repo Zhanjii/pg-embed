@@ -1,0 +1,60 @@
+# Plan: pg-embed fork: download status errors, mirror host, local binaries
+
+Branch: `feature/download-host-and-local-binaries` (worktree
+`/Volumes/Work/work/pg-embed-feature-download-host-and-local-binaries`)
+Base: `0ffc50b88febfd54e231d1ae7d1ef50017ff77ac`, the rev InSync pins (CREATE_NO_WINDOW + fsync on), NOT `origin/master`.
+PR target: `Zhanjii/pg-embed`, base `fix/fsync-on` (it contains 0ffc50b). Never upstream `faokunega/pg-embed`.
+Origin: InSync P14 rollout master plan (`claude-code-hook-dashboard/plans/2026-10-31-p14-rollout-master.md`),
+"Operator pre-flight" + P14k row, finding A243, LD-P14-009 (InSync bundles PG 15 and points pg-embed at it).
+
+## Goal
+
+1. A 4xx/5xx binary download becomes a typed error naming the URL and status. It is never written to disk or unpacked as a zip.
+2. A configurable download host, so builds without the bundle can use a mirror. The current host stays the default.
+3. A "use these binaries" path: point pg-embed at an existing PG 15 install directory. pg-embed validates it and uses it instead of downloading.
+
+InSync's current call sites must compile and behave unchanged:
+`PgFetchSettings { version: PG_V15, ..Default::default() }` and a full `PgSettings { .. }` struct literal.
+
+## Locked decisions
+
+- **LD-P14kpre-001** Base on 0ffc50b and open the PR against `fix/fsync-on`. The CREATE_NO_WINDOW (`command_executor.rs`, `pg_access.rs::stop_db_command_sync`) and fsync (`pg_commands.rs`) changes stay as they are.
+- **LD-P14kpre-002** Clippy gate means **no new warnings**. At 0ffc50b, `cargo clippy --all-targets -- -D warnings` already fails with 48 errors, all in upstream code (`&PathBuf` params, redundant borrows, a manual `ToString` impl, and so on). We do not fix those (operator choice, 2026-11-04). This keeps the diff surgical and rebases onto upstream clean. The PR records the baseline count and shows that the count after the change is the same, with no warnings in new or changed lines. `cargo fmt --check` is clean at baseline and must stay clean.
+- **LD-P14kpre-003** Local binaries support **a directory only** (operator choice). There is no local-archive mode. The new field is `PgFetchSettings.local_binaries_dir: Option<PathBuf>`, default `None`. It goes on `PgFetchSettings`, not `PgSettings`: InSync builds `PgFetchSettings` with `..Default::default()`, so a new field there is source-compatible, whereas a new `PgSettings` field would break InSync's full struct literal.
+- **LD-P14kpre-004** "Configurable host" is the **existing** `PgFetchSettings.host` field (default `https://repo1.maven.org`). We keep it and make it robust and tested. We do not add a second setting. The URL building moves into a pure `pub fn download_url(&self) -> String`. A trailing `/` on the host is trimmed, so `https://mirror/` does not produce `//maven2`. A mirror must serve the Maven layout `<host>/maven2/io/zonky/test/postgres/embedded-postgres-binaries-<platform>/<version>/embedded-postgres-binaries-<platform>-<version>.jar`. This is documented on the field and in the README.
+- **LD-P14kpre-005** No new `PgEmbedErrorType` variants. The enum is exhaustive, and a new variant would break any downstream exhaustive `match`. HTTP status failures use `DownloadFailure` with `message` naming the URL and status. A missing or invalid local binaries dir uses `InvalidPgPackage` with `message` naming the dir and every missing executable.
+- **LD-P14kpre-006** Local-dir validation happens in `PgAccess::new`, which `PgEmbed::new` calls, so the error surfaces at construction time, before any download or initdb. The check is that `bin/initdb`, `bin/pg_ctl` and `bin/postgres` (each with `std::env::consts::EXE_SUFFIX`) exist as files. All missing ones are reported in one message. The version is not checked (out of scope, see Not handled).
+- **LD-P14kpre-007** In local mode, `PgAccess.pg_ctl_exe` and `init_db_exe` point into `local_binaries_dir/bin`. `acquisition_needed()` then returns `false` through the existing `pg_executables_cached()` check (initdb exists), so `setup()` never downloads. No new branch in `PgEmbed::setup` is needed. The cache directory is still created as before; that is harmless and keeps the diff small.
+- **LD-P14kpre-008** On a non-success status, read the body best-effort and log it at `warn` with the URL and status, truncated to 512 bytes (an HTML error page, never secrets). Then return the error. The URL is logged at `debug` before the request (defensive-logging convention).
+- **LD-P14kpre-009** No `/repo-setup` and no CLAUDE.md for the fork. It is an upstream fork we want to stay rebase-clean, and the kickoff scope is the fork change only. The only non-source addition is this plan file.
+
+## Checklist
+
+- [ ] 1. **Download URL + status error** (`src/pg_fetch.rs`). Sensitive: no
+  - Add `pub fn download_url(&self) -> String` (host trailing-`/` trimmed; same path as today).
+  - `fetch_postgres`: `log::debug!` the URL; transport error → `DownloadFailure` with message `"failed to download PostgreSQL binaries from {url}"` + source; non-success status → best-effort body, `log::warn!(url, status, body≤512B)`, return `DownloadFailure` with message `"downloading PostgreSQL binaries from {url} failed with HTTP status {status}"`; body-read failure → `ConversionFailure` with message naming the URL.
+  - Doc comment on `host` that explains the Maven-layout requirement for mirrors.
+- [ ] 2. **`local_binaries_dir` setting** (`src/pg_fetch.rs`). Sensitive: no
+  - New `pub local_binaries_dir: Option<PathBuf>` with a doc comment (PG 15 tree containing `bin/`; must match `version`; skips download). `Default` → `None`.
+- [ ] 3. **Local-dir resolution + validation** (`src/pg_access.rs`). Sensitive: no
+  - In `PgAccess::new`, when `local_binaries_dir` is `Some(dir)`: validate (LD-006), then set `pg_ctl_exe = dir/bin/pg_ctl`, `init_db_exe = dir/bin/initdb`. Otherwise unchanged.
+  - A small private helper `fn validate_local_binaries_dir(dir: &Path) -> PgResult<()>` so it is unit-testable.
+- [ ] 4. **Tests**. Sensitive: no
+  - Add dev-dependency `tempfile = "3"`.
+  - `pg_fetch` unit tests: default-host URL for a fixed os/arch/`PG_V15`; custom host; host with trailing `/`.
+  - `pg_fetch` unit tests with a one-shot local HTTP server (a `tokio::net::TcpListener` on `127.0.0.1:0` writing a canned response, no new deps): 404 → `Err(DownloadFailure)` whose message contains the URL and `404`; 500 likewise; 200 → `Ok` bytes equal to the body. No real network.
+  - `pg_access` tests with a `tempfile::TempDir` holding fake `bin/{initdb,pg_ctl,postgres}{EXE_SUFFIX}`: valid dir → `PgAccess::new` OK, exe paths point into the dir, `acquisition_needed()` is `false`; missing `postgres` → `Err(InvalidPgPackage)` naming it; nonexistent dir → `Err(InvalidPgPackage)`.
+  - Vertical slice: `PgEmbed::new(settings, PgFetchSettings { local_binaries_dir: Some(fake), ..Default::default() })`, then assert `pg_access.acquisition_needed()` is `false` and the exe paths point into the fake dir. This proves the setting flows API → access layer with no download.
+  - Compile check that InSync's exact call shape still builds (a test constructing `PgFetchSettings { version: PG_V15, ..Default::default() }` and a full `PgSettings` literal).
+- [ ] 5. **Docs**: README section on `host` (mirror layout) and `local_binaries_dir`; CHANGELOG entry under Unreleased. Sensitive: no
+- [ ] 6. **Validate**: `cargo fmt --check`; `cargo clippy --all-targets -- -D warnings` (per LD-002: same 48 baseline errors, none in new code; also run without `-D` and diff the warning list against the baseline); `cargo test --lib` (new unit tests). Run the existing integration tests (`cargo test`) as they are today; they already download from Maven, and their result is recorded honestly. Sensitive: no
+- [ ] 7. **PR + report-back**: push, open a PR against `fix/fsync-on` with fmt/clippy/test results. There is no CI in the fork, so the local gate decides. Merge-on-green is granted within Zhanjii/pg-embed. Report to the orchestrator (`main:0.0`): the merge sha InSync should pin, plus the setting names and defaults (`host` = `https://repo1.maven.org`, `local_binaries_dir` = `None`). Sensitive: no
+
+## Not handled (intentional)
+
+- Version check of the local binaries (for example running `postgres --version`). A wrong-version bundle fails in initdb/postgres with Postgres's own error. InSync controls what it bundles.
+- Local archive (zip/jar) input (LD-003).
+- A full download-URL override for mirrors with a non-Maven layout (LD-004). The mirror must mirror the layout.
+- Retries or timeouts on the download (unchanged behavior).
+- The `surf` / async-std feature paths. `pg_fetch` already uses `reqwest` unconditionally, so they are untouched.
+- The 48 pre-existing clippy errors (LD-002).
