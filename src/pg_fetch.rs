@@ -244,10 +244,41 @@ fn truncate_for_log(body: &[u8]) -> String {
     format!("{}...", &text[..end])
 }
 
+// reqwest's default client honours HTTP_PROXY/HTTPS_PROXY; set NO_PROXY=127.0.0.1 if
+// these tests fail behind a proxy.
+/// Serves exactly one canned HTTP response on a local port and returns the host url.
+/// Shared with the postgres.rs tests.
+#[cfg(test)]
+pub(crate) async fn serve_once(status_line: &'static str, body: Vec<u8>) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = socket.read(&mut buffer).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..read]);
+        }
+        let head = format!(
+            "HTTP/1.1 {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            status_line,
+            body.len()
+        );
+        socket.write_all(head.as_bytes()).await.unwrap();
+        socket.write_all(&body).await.unwrap();
+        socket.shutdown().await.unwrap();
+    });
+    format!("http://127.0.0.1:{}", port)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
     fn fixed_settings(host: &str) -> PgFetchSettings {
@@ -305,35 +336,6 @@ mod tests {
         let truncated = truncate_for_log(body.as_bytes());
         assert!(truncated.ends_with("..."));
         assert!(truncated.len() <= MAX_LOGGED_BODY_BYTES + 3);
-    }
-
-    // reqwest's default client honours HTTP_PROXY/HTTPS_PROXY; set NO_PROXY=127.0.0.1 if
-    // these tests fail behind a proxy.
-    /// Serves exactly one canned HTTP response on a local port and returns the host url.
-    async fn serve_once(status_line: &'static str, body: Vec<u8>) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            let mut buffer = [0u8; 1024];
-            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
-                let read = socket.read(&mut buffer).await.unwrap();
-                if read == 0 {
-                    break;
-                }
-                request.extend_from_slice(&buffer[..read]);
-            }
-            let head = format!(
-                "HTTP/1.1 {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                status_line,
-                body.len()
-            );
-            socket.write_all(head.as_bytes()).await.unwrap();
-            socket.write_all(&body).await.unwrap();
-            socket.shutdown().await.unwrap();
-        });
-        format!("http://127.0.0.1:{}", port)
     }
 
     #[tokio::test]
