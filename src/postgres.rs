@@ -137,8 +137,10 @@ impl PgEmbed {
     ///
     pub async fn acquire_postgres(&self) -> PgResult<()> {
         // In local mode cache_dir is the user's own installation; downloading would write
-        // a zip into it and unpack over it, so refuse before touching anything.
-        if self.fetch_settings.local_binaries_dir.is_some() {
+        // a zip into it and unpack over it, so refuse before touching anything. Guard on
+        // PgAccess's copy of the setting: every path was built from it, whereas the pub
+        // fetch_settings field can be mutated after construction.
+        if self.pg_access.uses_local_binaries() {
             return Err(PgEmbedError {
                 error_type: PgEmbedErrorType::InvalidPgPackage,
                 source: None,
@@ -364,6 +366,7 @@ impl PgEmbed {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pg_access::fake_installation;
     use crate::pg_fetch::{PgFetchSettings, PG_V15};
 
     fn settings_for(database_dir: PathBuf) -> PgSettings {
@@ -379,34 +382,24 @@ mod tests {
         }
     }
 
-    /// Guards source compatibility for callers that build `PgFetchSettings` with
-    /// `..Default::default()`: adding fields must not break them.
+    /// Exists to guard compilation of both literal shapes callers use: `PgFetchSettings`
+    /// with `..Default::default()` and a fully spelled-out `PgSettings`. Adding fields
+    /// must not break either.
     #[test]
     fn default_fetch_settings_struct_update_syntax_compiles() {
         let fetch_settings = PgFetchSettings {
             version: PG_V15,
             ..Default::default()
         };
-        let pg_settings = settings_for(PathBuf::from("unused"));
+        let _pg_settings = settings_for(PathBuf::from("unused"));
         assert!(fetch_settings.local_binaries_dir.is_none());
         assert_eq!(fetch_settings.host, "https://repo1.maven.org");
-        assert!(pg_settings.persistent);
     }
 
     #[tokio::test]
     async fn local_binaries_dir_flows_through_pg_embed_new() {
-        let installation = tempfile::tempdir().unwrap();
-        let bin_dir = installation.path().join("bin");
-        std::fs::create_dir_all(&bin_dir).unwrap();
-        std::fs::create_dir_all(installation.path().join("share")).unwrap();
-        for name in ["initdb", "pg_ctl", "postgres"] {
-            // Empty files: the Drop impl must never run anything real.
-            std::fs::write(
-                bin_dir.join(format!("{}{}", name, std::env::consts::EXE_SUFFIX)),
-                b"",
-            )
-            .unwrap();
-        }
+        // Empty stand-in executables: the Drop impl must never run anything real.
+        let installation = fake_installation(&[]);
         let database = tempfile::tempdir().unwrap();
         let mut pg = PgEmbed::new(
             settings_for(database.path().join("db")),
@@ -426,17 +419,7 @@ mod tests {
 
     #[tokio::test]
     async fn acquire_postgres_is_refused_in_local_mode() {
-        let installation = tempfile::tempdir().unwrap();
-        let bin_dir = installation.path().join("bin");
-        std::fs::create_dir_all(&bin_dir).unwrap();
-        std::fs::create_dir_all(installation.path().join("share")).unwrap();
-        for name in ["initdb", "pg_ctl", "postgres"] {
-            std::fs::write(
-                bin_dir.join(format!("{}{}", name, std::env::consts::EXE_SUFFIX)),
-                b"",
-            )
-            .unwrap();
-        }
+        let installation = fake_installation(&[]);
         let database = tempfile::tempdir().unwrap();
         let mut pg = PgEmbed::new(
             settings_for(database.path().join("db")),
