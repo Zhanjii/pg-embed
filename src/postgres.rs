@@ -366,8 +366,10 @@ mod tests {
         }
     }
 
+    /// Guards source compatibility for callers that build `PgFetchSettings` with
+    /// `..Default::default()`: adding fields must not break them.
     #[test]
-    fn insync_call_shape_compiles_with_defaults() {
+    fn default_fetch_settings_struct_update_syntax_compiles() {
         let fetch_settings = PgFetchSettings {
             version: PG_V15,
             ..Default::default()
@@ -384,6 +386,7 @@ mod tests {
         let installation = tempfile::tempdir().unwrap();
         let bin_dir = installation.path().join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::create_dir_all(installation.path().join("share")).unwrap();
         for name in ["initdb", "pg_ctl", "postgres"] {
             // Empty files: the Drop impl must never run anything real.
             std::fs::write(
