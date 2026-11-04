@@ -158,7 +158,9 @@ impl PgEmbed {
         // already held, and that await contends with polling waiters for the status lock;
         // a cancellation there would otherwise leave the status in progress forever. If
         // marking itself fails, the unreleased guard clears the entry, which is right since
-        // this instance never acquired anything and waiters must be free to retry.
+        // this instance never acquired anything and waiters must be free to retry. The guard
+        // only clears an entry this instance set, so a cancellation before marking on the
+        // first-acquisition path cannot clear a peer's live claim.
         let mut claim_guard = self.pg_access.acquisition_claim_guard();
         self.pg_access.mark_acquisition_in_progress().await?;
         let result = match self.acquire_postgres_steps().await {
@@ -467,5 +469,51 @@ mod tests {
             .filter(|entry| entry.path().extension() == Some(std::ffi::OsStr::new("zip")))
             .count();
         assert_eq!(zip_files, 0);
+    }
+
+    fn zip_files_under(dir: &std::path::Path) -> Vec<PathBuf> {
+        let mut zip_files = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                zip_files.extend(zip_files_under(&path));
+            } else if path.extension() == Some(std::ffi::OsStr::new("zip")) {
+                zip_files.push(path);
+            }
+        }
+        zip_files
+    }
+
+    #[tokio::test]
+    async fn failed_download_resets_acquisition_status_and_writes_no_zip() {
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let cache_dir = temporary_directory.path().join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let host = crate::pg_fetch::serve_once("404 Not Found", b"not here".to_vec()).await;
+        // A struct literal: PgEmbed::new in remote mode would create the real user cache.
+        let mut pg = PgEmbed {
+            pg_settings: settings_for(temporary_directory.path().join("db")),
+            fetch_settings: PgFetchSettings {
+                host,
+                ..Default::default()
+            },
+            db_uri: "postgres://postgres:password@localhost:5432".to_string(),
+            server_status: Arc::new(Mutex::new(PgServerStatus::Uninitialized)),
+            shutting_down: false,
+            pg_access: crate::pg_access::access_for(&cache_dir),
+        };
+        // Drop must neither run pg_ctl nor clean anything up.
+        pg.shutting_down = true;
+        pg.pg_settings.persistent = true;
+
+        let error = pg.acquire_postgres().await.unwrap_err();
+        assert_eq!(error.error_type, PgEmbedErrorType::DownloadFailure);
+        let message = error.message.clone().unwrap();
+        assert!(message.contains("404"), "{}", message);
+        assert!(
+            pg.pg_access.acquisition_status().await
+                == crate::pg_enums::PgAcquisitionStatus::Undefined
+        );
+        assert!(zip_files_under(&cache_dir).is_empty());
     }
 }

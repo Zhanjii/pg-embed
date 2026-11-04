@@ -5,6 +5,7 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use futures::TryFutureExt;
@@ -24,8 +25,36 @@ lazy_static! {
     /// Used to prevent simultaneous downloads and unpacking of the same binaries
     /// while executing multiple PgEmbed instances concurrently.
     ///
-    static ref ACQUIRED_PG_BINS: Arc<Mutex<HashMap<PathBuf, PgAcquisitionStatus>>> =
+    static ref ACQUIRED_PG_BINS: Arc<Mutex<HashMap<PathBuf, AcquisitionEntry>>> =
     Arc::new(Mutex::new(HashMap::with_capacity(5)));
+}
+
+/// Source of `PgAccess::acquisition_owner_id`; only uniqueness matters, so Relaxed suffices.
+static NEXT_ACQUISITION_OWNER_ID: AtomicU64 = AtomicU64::new(0);
+
+fn next_acquisition_owner_id() -> u64 {
+    NEXT_ACQUISITION_OWNER_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// A cache directory's acquisition status plus the `PgAccess` that set it.
+///
+/// Several instances share one cache directory entry, so resets (cancellation guard,
+/// failed attempt) must only remove the entry they set; otherwise a cancelled or failed
+/// instance could clear a peer's live claim and let a second download race it.
+struct AcquisitionEntry {
+    status: PgAcquisitionStatus,
+    owner_id: u64,
+}
+
+/// Removes the entry only while `owner_id` still owns it.
+fn remove_acquisition_entry_if_owned(
+    entries: &mut HashMap<PathBuf, AcquisitionEntry>,
+    cache_dir: &Path,
+    owner_id: u64,
+) {
+    if matches!(entries.get(cache_dir), Some(entry) if entry.owner_id == owner_id) {
+        entries.remove(cache_dir);
+    }
 }
 
 ///
@@ -36,6 +65,7 @@ lazy_static! {
 ///
 pub(crate) struct AcquisitionClaimGuard {
     cache_dir: PathBuf,
+    owner_id: u64,
     released: bool,
 }
 
@@ -52,15 +82,19 @@ impl Drop for AcquisitionClaimGuard {
             return;
         }
         // Drop cannot await and must not block a runtime thread, so the lock is only tried.
+        // The owner check matters on both paths: cancelled before marking, the entry may be a
+        // peer's live claim, and by the time the spawned reset runs a peer may have re-claimed.
         if let Ok(mut lock) = ACQUIRED_PG_BINS.try_lock() {
-            lock.remove(&self.cache_dir);
+            remove_acquisition_entry_if_owned(&mut lock, &self.cache_dir, self.owner_id);
             return;
         }
         let cache_dir = self.cache_dir.clone();
+        let owner_id = self.owner_id;
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
-                    ACQUIRED_PG_BINS.lock().await.remove(&cache_dir);
+                    let mut lock = ACQUIRED_PG_BINS.lock().await;
+                    remove_acquisition_entry_if_owned(&mut lock, &cache_dir, owner_id);
                 });
             }
             Err(_) => log::warn!(
@@ -98,6 +132,8 @@ pub struct PgAccess {
     pg_version_file: PathBuf,
     /// Existing postgresql installation used instead of the cache, if configured
     local_binaries_dir: Option<PathBuf>,
+    /// Identifies this instance's entries in the shared acquisition status map
+    acquisition_owner_id: u64,
 }
 
 impl PgAccess {
@@ -179,6 +215,7 @@ impl PgAccess {
             zip_file_path,
             pg_version_file,
             local_binaries_dir,
+            acquisition_owner_id: next_acquisition_owner_id(),
         })
     }
 
@@ -379,8 +416,8 @@ impl PgAccess {
     /// of PgEmbed try to acquire the same resources
     ///
     pub async fn mark_acquisition_in_progress(&self) -> PgResult<()> {
-        let mut lock = ACQUIRED_PG_BINS.lock().await;
-        lock.insert(self.cache_dir.clone(), PgAcquisitionStatus::InProgress);
+        self.set_acquisition_status(PgAcquisitionStatus::InProgress)
+            .await;
         Ok(())
     }
 
@@ -391,9 +428,20 @@ impl PgAccess {
     /// of PgEmbed don't try to reacquire resources
     ///
     pub async fn mark_acquisition_finished(&self) -> PgResult<()> {
-        let mut lock = ACQUIRED_PG_BINS.lock().await;
-        lock.insert(self.cache_dir.clone(), PgAcquisitionStatus::Finished);
+        self.set_acquisition_status(PgAcquisitionStatus::Finished)
+            .await;
         Ok(())
+    }
+
+    async fn set_acquisition_status(&self, status: PgAcquisitionStatus) {
+        let mut lock = ACQUIRED_PG_BINS.lock().await;
+        lock.insert(
+            self.cache_dir.clone(),
+            AcquisitionEntry {
+                status,
+                owner_id: self.acquisition_owner_id,
+            },
+        );
     }
 
     ///
@@ -403,9 +451,13 @@ impl PgAccess {
     /// wait while the status is in progress, so leaving it set after a failed attempt would
     /// make them wait forever.
     ///
+    /// Only resets a status this instance set: if a peer has since claimed the cache
+    /// directory, its acquisition is still running and clearing it would let another
+    /// waiter start a second, racing download.
+    ///
     pub async fn mark_acquisition_failed(&self) -> PgResult<()> {
         let mut lock = ACQUIRED_PG_BINS.lock().await;
-        lock.remove(&self.cache_dir);
+        remove_acquisition_entry_if_owned(&mut lock, &self.cache_dir, self.acquisition_owner_id);
         Ok(())
     }
 
@@ -414,10 +466,10 @@ impl PgAccess {
     ///
     pub async fn acquisition_status(&self) -> PgAcquisitionStatus {
         let lock = ACQUIRED_PG_BINS.lock().await;
-        let acquisition_status = lock.get(&self.cache_dir);
-        match acquisition_status {
+        let acquisition_entry = lock.get(&self.cache_dir);
+        match acquisition_entry {
             None => PgAcquisitionStatus::Undefined,
-            Some(status) => *status,
+            Some(entry) => entry.status,
         }
     }
 
@@ -428,13 +480,20 @@ impl PgAccess {
     ///
     async fn try_claim_acquisition(&self) -> bool {
         let mut lock = ACQUIRED_PG_BINS.lock().await;
-        match lock.get(&self.cache_dir) {
-            None | Some(PgAcquisitionStatus::Undefined) => {
-                lock.insert(self.cache_dir.clone(), PgAcquisitionStatus::InProgress);
-                true
-            }
-            Some(_) => false,
+        let claimable = match lock.get(&self.cache_dir) {
+            None => true,
+            Some(entry) => entry.status == PgAcquisitionStatus::Undefined,
+        };
+        if claimable {
+            lock.insert(
+                self.cache_dir.clone(),
+                AcquisitionEntry {
+                    status: PgAcquisitionStatus::InProgress,
+                    owner_id: self.acquisition_owner_id,
+                },
+            );
         }
+        claimable
     }
 
     ///
@@ -443,6 +502,7 @@ impl PgAccess {
     pub(crate) fn acquisition_claim_guard(&self) -> AcquisitionClaimGuard {
         AcquisitionClaimGuard {
             cache_dir: self.cache_dir.clone(),
+            owner_id: self.acquisition_owner_id,
             released: false,
         }
     }
@@ -664,6 +724,24 @@ pub(crate) fn fake_installation(omit: &[&str]) -> tempfile::TempDir {
     installation
 }
 
+/// A remote-mode struct literal keyed by `dir`; remote-mode `new` would touch the real cache.
+/// Every call is a distinct acquisition owner, like a separate `PgEmbed` instance.
+/// Shared with the postgres.rs tests.
+#[cfg(test)]
+pub(crate) fn access_for(dir: &Path) -> PgAccess {
+    PgAccess {
+        cache_dir: dir.to_path_buf(),
+        database_dir: dir.join("db"),
+        pg_ctl_exe: dir.join("bin").join("pg_ctl"),
+        init_db_exe: dir.join("bin").join("initdb"),
+        pw_file_path: dir.join("db.pwfile"),
+        zip_file_path: dir.join("binaries.zip"),
+        pg_version_file: dir.join("db").join("PG_VERSION"),
+        local_binaries_dir: None,
+        acquisition_owner_id: next_acquisition_owner_id(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -858,20 +936,6 @@ mod tests {
         assert!(access.acquisition_status().await == PgAcquisitionStatus::Undefined);
     }
 
-    // A struct literal keyed by a temp dir: remote-mode `new` would touch the real cache.
-    fn access_for(dir: &Path) -> PgAccess {
-        PgAccess {
-            cache_dir: dir.to_path_buf(),
-            database_dir: dir.join("db"),
-            pg_ctl_exe: dir.join("bin").join("pg_ctl"),
-            init_db_exe: dir.join("bin").join("initdb"),
-            pw_file_path: dir.join("db.pwfile"),
-            zip_file_path: dir.join("binaries.zip"),
-            pg_version_file: dir.join("db").join("PG_VERSION"),
-            local_binaries_dir: None,
-        }
-    }
-
     #[tokio::test]
     async fn unreleased_claim_guard_resets_status_on_drop() {
         let cache = tempfile::tempdir().unwrap();
@@ -901,14 +965,47 @@ mod tests {
         access.mark_acquisition_failed().await.unwrap();
     }
 
+    // Regression: a guard cancelled before its own claim used to clear a peer's live claim.
+    #[tokio::test]
+    async fn unreleased_claim_guard_leaves_peer_claim_untouched() {
+        let cache = tempfile::tempdir().unwrap();
+        let cancelled_instance = access_for(cache.path());
+        let claiming_peer = access_for(cache.path());
+        claiming_peer.mark_acquisition_in_progress().await.unwrap();
+        drop(cancelled_instance.acquisition_claim_guard());
+        // Give a contended try_lock's spawned fallback time to run before asserting.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        {
+            let lock = ACQUIRED_PG_BINS.lock().await;
+            let entry = lock
+                .get(cache.path())
+                .expect("the peer's claim must survive");
+            assert!(entry.status == PgAcquisitionStatus::InProgress);
+            assert_eq!(entry.owner_id, claiming_peer.acquisition_owner_id);
+        }
+        claiming_peer.mark_acquisition_failed().await.unwrap();
+        assert!(claiming_peer.acquisition_status().await == PgAcquisitionStatus::Undefined);
+    }
+
+    #[tokio::test]
+    async fn failed_mark_from_non_owner_leaves_peer_claim_untouched() {
+        let cache = tempfile::tempdir().unwrap();
+        let other_instance = access_for(cache.path());
+        let claiming_peer = access_for(cache.path());
+        claiming_peer.mark_acquisition_in_progress().await.unwrap();
+        other_instance.mark_acquisition_failed().await.unwrap();
+        assert!(claiming_peer.acquisition_status().await == PgAcquisitionStatus::InProgress);
+        claiming_peer.mark_acquisition_failed().await.unwrap();
+    }
+
     // Regression: waiters used to hang forever when the peer's acquisition failed.
     #[tokio::test]
     async fn waiter_retries_after_peer_acquisition_failed() {
         let temporary_directory = tempfile::tempdir().unwrap();
         let access = access_for(temporary_directory.path());
-        access.mark_acquisition_in_progress().await.unwrap();
-
         let failing_peer = access_for(temporary_directory.path());
+        failing_peer.mark_acquisition_in_progress().await.unwrap();
+
         let peer_task = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(250)).await;
             failing_peer.mark_acquisition_failed().await.unwrap();
@@ -927,33 +1024,36 @@ mod tests {
     async fn only_one_waiter_claims_retry_after_peer_failure() {
         let temporary_directory = tempfile::tempdir().unwrap();
         let path = temporary_directory.path().to_path_buf();
-        access_for(&path)
-            .mark_acquisition_in_progress()
-            .await
-            .unwrap();
+        let failing_peer = access_for(&path);
+        failing_peer.mark_acquisition_in_progress().await.unwrap();
 
+        // The timeout only bounds the losing waiter; the winner claims right after the
+        // peer fails at ~250ms, well inside it.
         let waiter = |path: PathBuf| {
             tokio::spawn(async move {
-                tokio::time::timeout(
-                    Duration::from_secs(2),
-                    access_for(&path).acquisition_needed(),
-                )
-                .await
+                let access = access_for(&path);
+                let result =
+                    tokio::time::timeout(Duration::from_secs(1), access.acquisition_needed()).await;
+                (access, result)
             })
         };
         let first_waiter = waiter(path.clone());
         let second_waiter = waiter(path.clone());
 
-        let failing_peer = access_for(&path);
         let peer_task = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(250)).await;
             failing_peer.mark_acquisition_failed().await.unwrap();
         });
 
-        let results = vec![first_waiter.await.unwrap(), second_waiter.await.unwrap()];
+        let (first_access, first_result) = first_waiter.await.unwrap();
+        let (second_access, second_result) = second_waiter.await.unwrap();
         peer_task.await.unwrap();
-        access_for(&path).mark_acquisition_failed().await.unwrap();
+        // Only the winning waiter owns the claim, so only its reset takes effect.
+        first_access.mark_acquisition_failed().await.unwrap();
+        second_access.mark_acquisition_failed().await.unwrap();
+        assert!(first_access.acquisition_status().await == PgAcquisitionStatus::Undefined);
 
+        let results = vec![first_result, second_result];
         let claimed = results
             .iter()
             .filter(|result| matches!(result, Ok(Ok(true))))
