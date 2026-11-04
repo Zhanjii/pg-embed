@@ -38,6 +38,8 @@ pub struct PgFetchSettings {
     /// A mirror must serve the Maven layout
     /// `<host>/maven2/io/zonky/test/postgres/embedded-postgres-binaries-<platform>/<version>/embedded-postgres-binaries-<platform>-<version>.jar`,
     /// because only the host part of the download url is configurable.
+    /// Credentials in the host (`https://user:token@mirror`) are sent as basic auth
+    /// but redacted from logs and errors.
     pub host: String,
     /// The operation system
     pub operating_system: OperationSystem,
@@ -98,14 +100,16 @@ impl PgFetchSettings {
     ///
     pub async fn fetch_postgres(&self) -> PgResult<Box<Bytes>> {
         let download_url = self.download_url();
-        log::debug!("downloading PostgreSQL binaries from {}", download_url);
-        let response: Response = reqwest::get(&download_url)
+        // The host may carry basic-auth credentials; only the redacted form is ever logged or put in errors.
+        let loggable_url = redact_url_credentials(&download_url);
+        log::debug!("downloading PostgreSQL binaries from {}", loggable_url);
+        let mut response: Response = reqwest::get(&download_url)
             .map_err(|e| PgEmbedError {
                 error_type: PgEmbedErrorType::DownloadFailure,
                 source: Some(Box::new(e)),
                 message: Some(format!(
                     "failed to download PostgreSQL binaries from {}",
-                    download_url
+                    loggable_url
                 )),
             })
             .await?;
@@ -114,13 +118,26 @@ impl PgFetchSettings {
         if !status.is_success() {
             // Without this check an HTML error page would be written to disk and unpacked as a zip.
             // The body is only read for the log; failing to read it must not hide the status error.
-            let body_for_log = match response.bytes().await {
-                Ok(body_bytes) => truncate_for_log(&body_bytes),
-                Err(error) => format!("<body unreadable: {}>", error),
+            // Reading stops at the log limit so a huge error page is not buffered.
+            let mut body_prefix: Vec<u8> = Vec::new();
+            let mut body_read_error: Option<reqwest::Error> = None;
+            while body_prefix.len() < MAX_LOGGED_BODY_BYTES {
+                match response.chunk().await {
+                    Ok(Some(chunk)) => body_prefix.extend_from_slice(&chunk),
+                    Ok(None) => break,
+                    Err(error) => {
+                        body_read_error = Some(error);
+                        break;
+                    }
+                }
+            }
+            let body_for_log = match body_read_error {
+                None => truncate_for_log(&body_prefix),
+                Some(error) => format!("<body unreadable: {}>", error),
             };
             log::warn!(
                 "downloading PostgreSQL binaries from {} failed with HTTP status {}, body: {}",
-                download_url,
+                loggable_url,
                 status,
                 body_for_log
             );
@@ -129,7 +146,7 @@ impl PgFetchSettings {
                 source: None,
                 message: Some(format!(
                     "downloading PostgreSQL binaries from {} failed with HTTP status {}",
-                    download_url, status
+                    loggable_url, status
                 )),
             });
         }
@@ -141,7 +158,7 @@ impl PgFetchSettings {
                 source: Some(Box::new(e)),
                 message: Some(format!(
                     "failed to read the response body from {}",
-                    download_url
+                    loggable_url
                 )),
             })
             .await?;
@@ -152,6 +169,22 @@ impl PgFetchSettings {
 
 /// Maximum number of bytes of an error response body that is logged
 const MAX_LOGGED_BODY_BYTES: usize = 512;
+
+/// Strip basic-auth credentials from a url so it is safe to log or embed in an error
+fn redact_url_credentials(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(mut parsed) => {
+            if !parsed.username().is_empty() || parsed.password().is_some() {
+                // These only fail for cannot-be-a-base urls, which cannot carry credentials.
+                let _ = parsed.set_username("");
+                let _ = parsed.set_password(None);
+            }
+            parsed.to_string()
+        }
+        // An unparseable url may still embed credentials; reqwest fails on it too and its error source is attached.
+        Err(_) => "<unparseable download url>".to_string(),
+    }
+}
 
 /// Render an error response body for logging, cut to at most `MAX_LOGGED_BODY_BYTES`
 fn truncate_for_log(body: &[u8]) -> String {
@@ -257,6 +290,36 @@ mod tests {
         assert_eq!(error.error_type, PgEmbedErrorType::DownloadFailure);
         let message = error.message.unwrap();
         assert!(message.contains(&settings.download_url()), "{}", message);
+        assert!(message.contains("404"), "{}", message);
+    }
+
+    #[test]
+    fn redact_url_credentials_removes_user_and_password() {
+        let redacted =
+            redact_url_credentials("https://user:secret@mirror.internal/maven2/some/file.jar");
+        assert!(!redacted.contains("user"), "{}", redacted);
+        assert!(!redacted.contains("secret"), "{}", redacted);
+        assert!(redacted.contains("mirror.internal"), "{}", redacted);
+        assert!(redacted.contains("/maven2/some/file.jar"), "{}", redacted);
+    }
+
+    #[test]
+    fn redact_url_credentials_hides_unparseable_url() {
+        assert_eq!(
+            redact_url_credentials("not a url user:secret@"),
+            "<unparseable download url>"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_postgres_error_does_not_leak_host_credentials() {
+        let host = serve_once("404 Not Found", b"nope".to_vec()).await;
+        let host_with_credentials = host.replace("http://", "http://user:secret@");
+        let settings = fixed_settings(&host_with_credentials);
+        let error = settings.fetch_postgres().await.unwrap_err();
+        assert_eq!(error.error_type, PgEmbedErrorType::DownloadFailure);
+        let message = error.message.unwrap();
+        assert!(!message.contains("secret"), "{}", message);
         assert!(message.contains("404"), "{}", message);
     }
 

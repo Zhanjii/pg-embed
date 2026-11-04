@@ -25,9 +25,6 @@ src/pg_enums.rs: warning: direct implementation of `ToString`
 src/pg_enums.rs: warning: direct implementation of `ToString`
 src/pg_enums.rs: warning: this `impl` can be derived
 src/pg_enums.rs: warning: this `impl` can be derived
-src/pg_fetch.rs: warning: redundant reference in `format!` argument: help: remove the redundant `&`: `platform`
-src/pg_fetch.rs: warning: redundant reference in `format!` argument: help: remove the redundant `&`: `platform`
-src/pg_fetch.rs: warning: redundant reference in `format!` argument: help: remove the redundant `&`: `self.host`
 src/pg_unpack.rs: warning: this expression creates a reference which is immediately dereferenced by the compiler: help: change this to: `cache_dir`
 src/pg_unpack.rs: warning: this expression creates a reference which is immediately dereferenced by the compiler: help: change this to: `cache_dir`
 src/pg_unpack.rs: warning: this expression creates a reference which is immediately dereferenced by the compiler: help: change this to: `file_path.as_path()`
