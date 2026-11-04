@@ -266,6 +266,8 @@ mod tests {
         assert!(truncated.len() <= MAX_LOGGED_BODY_BYTES + 3);
     }
 
+    // reqwest's default client honours HTTP_PROXY/HTTPS_PROXY; set NO_PROXY=127.0.0.1 if
+    // these tests fail behind a proxy.
     /// Serves exactly one canned HTTP response on a local port and returns the host url.
     async fn serve_once(status_line: &'static str, body: Vec<u8>) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

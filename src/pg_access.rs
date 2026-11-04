@@ -35,7 +35,7 @@ const PG_VERSION_FILE_NAME: &'static str = "PG_VERSION";
 /// Access to pg_ctl, initdb, database directory and cache directory
 ///
 pub struct PgAccess {
-    /// Cache directory path
+    /// Cache directory path; in local mode, the local installation directory instead
     pub cache_dir: PathBuf,
     /// Database directory path
     pub database_dir: PathBuf,
@@ -45,7 +45,7 @@ pub struct PgAccess {
     pub init_db_exe: PathBuf,
     /// Password file path
     pub pw_file_path: PathBuf,
-    /// Postgresql binaries zip file path
+    /// Postgresql binaries zip file path; unused (never written) in local mode
     pub zip_file_path: PathBuf,
     /// Postgresql database version file
     /// used for internal checks
@@ -55,6 +55,11 @@ pub struct PgAccess {
 }
 
 impl PgAccess {
+    /// Whether an existing installation is used instead of the download cache.
+    pub(crate) fn uses_local_binaries(&self) -> bool {
+        self.local_binaries_dir.is_some()
+    }
+
     ///
     /// Create a new instance
     ///
@@ -328,6 +333,18 @@ impl PgAccess {
     /// Write pg binaries zip to postgresql cache directory
     ///
     pub async fn write_pg_zip(&self, bytes: &[u8]) -> PgResult<()> {
+        // In local mode cache_dir is the user's own installation; never drop a zip into it.
+        if self.local_binaries_dir.is_some() {
+            return Err(PgEmbedError {
+                error_type: PgEmbedErrorType::InvalidPgPackage,
+                source: None,
+                message: Some(
+                    "write_pg_zip is not available when local_binaries_dir is set; \
+                     pg-embed never downloads in local mode"
+                        .to_string(),
+                ),
+            });
+        }
         let mut file: tokio::fs::File = tokio::fs::File::create(&self.zip_file_path.as_path())
             .map_err(|e| PgEmbedError {
                 error_type: PgEmbedErrorType::WriteFileError,
@@ -458,32 +475,53 @@ impl PgAccess {
     }
 }
 
+/// Creates an installation tree with empty stand-in executables, minus `omit`.
+/// Shared with the postgres.rs tests.
+#[cfg(test)]
+pub(crate) fn fake_installation(omit: &[&str]) -> tempfile::TempDir {
+    let installation = tempfile::tempdir().unwrap();
+    let bin_dir = installation.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    if !omit.contains(&"share") {
+        std::fs::create_dir_all(installation.path().join("share")).unwrap();
+    }
+    for name in ["initdb", "pg_ctl", "postgres"] {
+        if omit.contains(&name) {
+            continue;
+        }
+        let executable = bin_dir.join(format!("{}{}", name, std::env::consts::EXE_SUFFIX));
+        std::fs::write(&executable, b"").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    installation
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Creates an installation tree with empty stand-in executables, minus `omit`.
-    fn fake_installation(omit: &[&str]) -> tempfile::TempDir {
-        let installation = tempfile::tempdir().unwrap();
-        let bin_dir = installation.path().join("bin");
-        std::fs::create_dir_all(&bin_dir).unwrap();
-        if !omit.contains(&"share") {
-            std::fs::create_dir_all(installation.path().join("share")).unwrap();
-        }
-        for name in ["initdb", "pg_ctl", "postgres"] {
-            if omit.contains(&name) {
-                continue;
-            }
-            let executable = bin_dir.join(format!("{}{}", name, std::env::consts::EXE_SUFFIX));
-            std::fs::write(&executable, b"").unwrap();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
-                    .unwrap();
-            }
-        }
-        installation
+    #[tokio::test]
+    async fn write_pg_zip_is_refused_in_local_mode() {
+        let installation = fake_installation(&[]);
+        let database = tempfile::tempdir().unwrap();
+        let access = PgAccess::new(
+            &local_settings(installation.path()),
+            &database.path().join("db"),
+        )
+        .await
+        .unwrap();
+        let error = access.write_pg_zip(b"x").await.unwrap_err();
+        assert_eq!(error.error_type, PgEmbedErrorType::InvalidPgPackage);
+        let zip_files = std::fs::read_dir(installation.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().extension() == Some(std::ffi::OsStr::new("zip")))
+            .count();
+        assert_eq!(zip_files, 0);
     }
 
     fn local_settings(dir: &Path) -> PgFetchSettings {

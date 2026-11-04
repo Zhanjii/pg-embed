@@ -32,6 +32,7 @@ InSync's current call sites must compile and behave unchanged:
 - **LD-P14kpre-012** In local mode `acquisition_needed()` re-validates the directory and never returns `true`, so a bundle that disappears after `PgEmbed::new` gives `InvalidPgPackage` instead of a silent download into the cache (challenge-loop round 1).
 - **LD-P14kpre-013** Local-dir validation also requires a `share/` directory (initdb reads `postgres.bki` and timezone data from it). Only the directory is checked, because layouts differ: zonky puts files directly in `share/`, distro builds use `share/postgresql/...`. A path that is not valid UTF-8 is rejected, because upstream `stop_db_command_sync` calls `to_str().unwrap()` from `Drop`. The CHANGELOG notes that a full `PgFetchSettings` struct literal must add the new field (challenge-loop round 2).
 - **LD-P14kpre-014** Supersedes the "cache directory is still created" part of LD-007. In local mode `PgAccess.cache_dir` is the local install dir. No cache directory is created and `dirs::cache_dir()` is not needed, so a host without one still works and unit tests leave the real cache alone. `PgEmbed::acquire_postgres` returns `InvalidPgPackage` in local mode, so an explicit call can never write a zip into the install or unpack over it. `host` is documented as a repository base url that may carry a path prefix (Artifactory/Nexus remotes), with `/maven2/...` always appended (challenge-loop round 3).
+- **LD-P14kpre-015** Whether local mode is on is decided only by `PgAccess`'s private copy (`uses_local_binaries()`), never by the mutable public `PgEmbed.fetch_settings`. Both `acquire_postgres` and the public `write_pg_zip` refuse in local mode (challenge-loop round 4).
 
 ## Checklist
 
@@ -69,4 +70,5 @@ InSync's current call sites must compile and behave unchanged:
 - The `surf` / async-std feature paths. `pg_fetch` already uses `reqwest` unconditionally, so they are untouched.
 - The 48 pre-existing clippy errors (LD-002).
 - Pre-existing: a failed acquisition leaves `PgAcquisitionStatus::InProgress` set, so other `PgEmbed` instances in the same process wait forever. It does not affect InSync (one instance per process; the next launch is a new process). Follow-up candidate.
+- A mirror that answers `200 OK` with an HTML login or SSO page (Artifactory/Nexus behind auth) is still written and unpacked as a zip, and the unpack fails with `InvalidPgPackage`. A zip magic-byte check would catch it earlier. Out of scope: this plan covers status codes only (challenge-loop round 4 NIT).
 - Upstream integration fixtures pin `PG_V13`, which 404s on darwin-arm64 (pre-existing).
