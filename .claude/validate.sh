@@ -22,6 +22,8 @@ cargo test --lib
 
 # Line numbers are stripped so unrelated edits that shift upstream code do not
 # show up as new warnings; comm compares the sorted lists as multisets.
+# The full clippy message text is compared, so a toolchain upgrade that rewords lints
+# makes every baseline entry look new: regenerate the baseline then, from upstream code only.
 CLIPPY_BASELINE=".claude/clippy-baseline.txt"
 clippy_output=$(cargo clippy --all-targets --message-format=short 2>&1) || {
   echo "validate.sh: cargo clippy failed to run" >&2

@@ -86,7 +86,7 @@ impl PgAccess {
         // directory is where the binaries live.
         let cache_dir = match &local_binaries_dir {
             Some(local_binaries_dir) => local_binaries_dir.clone(),
-            None => Self::create_cache_dir_structure(&fetch_settings).await?,
+            None => Self::create_cache_dir_structure(fetch_settings).await?,
         };
         Self::create_db_dir_structure(database_dir).await?;
         // The executables come from the local installation when one is configured;
@@ -136,6 +136,14 @@ impl PgAccess {
     /// Make a user-supplied local binaries directory absolute
     ///
     fn absolute_local_binaries_dir(dir: &Path) -> PgResult<PathBuf> {
+        // Joining an empty path onto the cwd would silently use the cwd as the installation.
+        if dir.as_os_str().is_empty() {
+            return Err(PgEmbedError {
+                error_type: PgEmbedErrorType::InvalidPgPackage,
+                source: None,
+                message: Some("local binaries directory must not be empty".to_string()),
+            });
+        }
         if dir.is_absolute() {
             return Ok(dir.to_path_buf());
         }
@@ -183,7 +191,25 @@ impl PgAccess {
         let mut missing: Vec<String> = ["initdb", "pg_ctl", "postgres"]
             .iter()
             .map(|name| format!("bin/{}{}", name, std::env::consts::EXE_SUFFIX))
-            .filter(|relative| !dir.join(relative).is_file())
+            .filter_map(|relative| {
+                let path = dir.join(&relative);
+                if !path.is_file() {
+                    return Some(relative);
+                }
+                // Otherwise the failure only shows up later as a permission error from
+                // initdb or pg_ctl, far from the configuration that caused it.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let executable = std::fs::metadata(&path)
+                        .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+                        .unwrap_or(false);
+                    if !executable {
+                        return Some(format!("{} (not executable)", relative));
+                    }
+                }
+                None
+            })
             .collect();
         // initdb reads its template files from share/; the layout inside differs
         // between distributions, so only the directory itself is checked.
@@ -316,6 +342,19 @@ impl PgAccess {
     }
 
     ///
+    /// Mark postgresql binaries acquisition failed
+    ///
+    /// Resets the status to undefined. Other PgEmbed instances for the same cache directory
+    /// wait while the status is in progress, so leaving it set after a failed attempt would
+    /// make them wait forever.
+    ///
+    pub async fn mark_acquisition_failed(&self) -> PgResult<()> {
+        let mut lock = ACQUIRED_PG_BINS.lock().await;
+        lock.remove(&self.cache_dir);
+        Ok(())
+    }
+
+    ///
     /// Check postgresql acquisition status
     ///
     pub async fn acquisition_status(&self) -> PgAcquisitionStatus {
@@ -346,7 +385,10 @@ impl PgAccess {
                     while self.acquisition_status().await == PgAcquisitionStatus::InProgress {
                         interval.tick().await;
                     }
-                    Ok(false)
+                    // The peer may have failed and reset the status; acquiring again then
+                    // surfaces this instance's own error instead of running without binaries.
+                    // Two waiters may both retry, the same benign race as a first acquisition.
+                    Ok(!self.pg_executables_cached().await?)
                 }
                 PgAcquisitionStatus::Finished => Ok(false),
                 PgAcquisitionStatus::Undefined => Ok(true),
@@ -674,6 +716,84 @@ mod tests {
         let resolved = PgAccess::absolute_local_binaries_dir(Path::new("relative/bundle")).unwrap();
         assert!(resolved.is_absolute());
         assert!(resolved.ends_with("relative/bundle"));
+    }
+
+    #[test]
+    fn empty_local_binaries_dir_is_rejected() {
+        let error = PgAccess::absolute_local_binaries_dir(Path::new("")).unwrap_err();
+        assert_eq!(error.error_type, PgEmbedErrorType::InvalidPgPackage);
+        assert!(error.message.unwrap().contains("must not be empty"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_executable_local_binary_is_reported() {
+        use std::os::unix::fs::PermissionsExt;
+        let installation = fake_installation(&[]);
+        std::fs::set_permissions(
+            installation.path().join("bin/initdb"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        let error = PgAccess::validate_local_binaries_dir(installation.path()).unwrap_err();
+        assert_eq!(error.error_type, PgEmbedErrorType::InvalidPgPackage);
+        let message = error.message.unwrap();
+        assert!(
+            message.contains("bin/initdb (not executable)"),
+            "{}",
+            message
+        );
+        assert!(!message.contains("pg_ctl"), "{}", message);
+    }
+
+    #[tokio::test]
+    async fn failed_acquisition_resets_status_to_undefined() {
+        // Local mode keys the status map by the temp installation, never the real cache.
+        let installation = fake_installation(&[]);
+        let database = tempfile::tempdir().unwrap();
+        let access = PgAccess::new(
+            &local_settings(installation.path()),
+            &database.path().join("db"),
+        )
+        .await
+        .unwrap();
+        access.mark_acquisition_in_progress().await.unwrap();
+        assert!(access.acquisition_status().await == PgAcquisitionStatus::InProgress);
+        access.mark_acquisition_failed().await.unwrap();
+        assert!(access.acquisition_status().await == PgAcquisitionStatus::Undefined);
+    }
+
+    // Regression: waiters used to hang forever when the peer's acquisition failed.
+    #[tokio::test]
+    async fn waiter_retries_after_peer_acquisition_failed() {
+        fn access_for(dir: &Path) -> PgAccess {
+            PgAccess {
+                cache_dir: dir.to_path_buf(),
+                database_dir: dir.join("db"),
+                pg_ctl_exe: dir.join("bin").join("pg_ctl"),
+                init_db_exe: dir.join("bin").join("initdb"),
+                pw_file_path: dir.join("db.pwfile"),
+                zip_file_path: dir.join("binaries.zip"),
+                pg_version_file: dir.join("db").join("PG_VERSION"),
+                local_binaries_dir: None,
+            }
+        }
+
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let access = access_for(temporary_directory.path());
+        access.mark_acquisition_in_progress().await.unwrap();
+
+        let failing_peer = access_for(temporary_directory.path());
+        let peer_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            failing_peer.mark_acquisition_failed().await.unwrap();
+        });
+
+        let needed = tokio::time::timeout(Duration::from_secs(5), access.acquisition_needed())
+            .await
+            .expect("waiter must stop waiting once the peer acquisition failed");
+        peer_task.await.unwrap();
+        assert!(needed.unwrap());
     }
 
     #[test]

@@ -152,6 +152,23 @@ impl PgEmbed {
             });
         }
         self.pg_access.mark_acquisition_in_progress().await?;
+        match self.acquire_postgres_steps().await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                // Other instances wait while the status is in progress; reset it so they
+                // stop waiting and retry. The original error is what the caller needs.
+                if let Err(reset_error) = self.pg_access.mark_acquisition_failed().await {
+                    log::warn!(
+                        "could not reset the postgres acquisition status after a failed acquisition: {}",
+                        reset_error
+                    );
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn acquire_postgres_steps(&self) -> PgResult<()> {
         let pg_bin_data = &self.fetch_settings.fetch_postgres().await?;
         self.pg_access.write_pg_zip(&pg_bin_data).await?;
         pg_unpack::unpack_postgres(&self.pg_access.zip_file_path, &self.pg_access.cache_dir)
