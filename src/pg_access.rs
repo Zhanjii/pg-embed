@@ -50,6 +50,8 @@ pub struct PgAccess {
     /// Postgresql database version file
     /// used for internal checks
     pg_version_file: PathBuf,
+    /// Existing postgresql installation used instead of the cache, if configured
+    local_binaries_dir: Option<PathBuf>,
 }
 
 impl PgAccess {
@@ -108,6 +110,7 @@ impl PgAccess {
             pw_file_path: pw_file,
             zip_file_path,
             pg_version_file,
+            local_binaries_dir: fetch_settings.local_binaries_dir.clone(),
         })
     }
 
@@ -273,6 +276,12 @@ impl PgAccess {
     /// Determine if postgresql binaries acquisition is needed
     ///
     pub async fn acquisition_needed(&self) -> PgResult<bool> {
+        // Downloading into the cache would not help: the executables are run from the
+        // local directory, so a bundle that vanished after `new` must surface as an error.
+        if let Some(local_binaries_dir) = &self.local_binaries_dir {
+            Self::validate_local_binaries_dir(local_binaries_dir)?;
+            return Ok(false);
+        }
         if !self.pg_executables_cached().await? {
             match self.acquisition_status().await {
                 PgAcquisitionStatus::InProgress => {
@@ -489,7 +498,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn all_missing_executables_are_reported_together() {
+    async fn vanished_local_bundle_is_an_error_not_a_download() {
+        let installation = fake_installation(&[]);
+        let database = tempfile::tempdir().unwrap();
+        let access = PgAccess::new(
+            &local_settings(installation.path()),
+            &database.path().join("db"),
+        )
+        .await
+        .unwrap();
+        std::fs::remove_file(
+            installation
+                .path()
+                .join(format!("bin/initdb{}", std::env::consts::EXE_SUFFIX)),
+        )
+        .unwrap();
+        let error = access.acquisition_needed().await.unwrap_err();
+        assert_eq!(error.error_type, PgEmbedErrorType::InvalidPgPackage);
+    }
+
+    #[test]
+    fn all_missing_executables_are_reported_together() {
         let installation = fake_installation(&["initdb", "pg_ctl"]);
         let message = PgAccess::validate_local_binaries_dir(installation.path())
             .unwrap_err()
