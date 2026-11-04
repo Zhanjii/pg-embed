@@ -43,6 +43,7 @@ async-trait = "0.1"
 [dev-dependencies]
 serial_test = "0.5"
 env_logger = "0.8"
+tempfile = "3"
 
 [[test]]
 name = "migration_tokio"

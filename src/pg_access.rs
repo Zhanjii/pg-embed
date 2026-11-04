@@ -62,15 +62,32 @@ impl PgAccess {
         fetch_settings: &PgFetchSettings,
         database_dir: &PathBuf,
     ) -> Result<Self, PgEmbedError> {
+        // Validate before any directory is created so a bad path has no side effects.
+        if let Some(local_binaries_dir) = &fetch_settings.local_binaries_dir {
+            Self::validate_local_binaries_dir(local_binaries_dir)?;
+        }
         // cache directory
         let cache_dir = Self::create_cache_dir_structure(&fetch_settings).await?;
         Self::create_db_dir_structure(database_dir).await?;
-        // pg_ctl executable
-        let mut pg_ctl = cache_dir.clone();
-        pg_ctl.push("bin/pg_ctl");
-        // initdb executable
-        let mut init_db = cache_dir.clone();
-        init_db.push("bin/initdb");
+        // The executables come from the local installation when one is configured;
+        // pg_executables_cached() then sees initdb and no download is attempted.
+        // The exe suffix is included here (unlike the cache paths below) because
+        // pg_executables_cached() opens the path as a file, which needs ".exe" on Windows.
+        let (pg_ctl, init_db) = match &fetch_settings.local_binaries_dir {
+            Some(local_binaries_dir) => (
+                local_binaries_dir.join(format!("bin/pg_ctl{}", std::env::consts::EXE_SUFFIX)),
+                local_binaries_dir.join(format!("bin/initdb{}", std::env::consts::EXE_SUFFIX)),
+            ),
+            None => {
+                // pg_ctl executable
+                let mut pg_ctl = cache_dir.clone();
+                pg_ctl.push("bin/pg_ctl");
+                // initdb executable
+                let mut init_db = cache_dir.clone();
+                init_db.push("bin/initdb");
+                (pg_ctl, init_db)
+            }
+        };
         // postgres zip file
         let mut zip_file_path = cache_dir.clone();
         let platform = fetch_settings.platform();
@@ -91,6 +108,41 @@ impl PgAccess {
             pw_file_path: pw_file,
             zip_file_path,
             pg_version_file,
+        })
+    }
+
+    ///
+    /// Check that a local postgresql installation contains the executables pg-embed runs
+    ///
+    /// Reports every missing executable at once so the caller can fix them in one go.
+    ///
+    fn validate_local_binaries_dir(dir: &Path) -> PgResult<()> {
+        if !dir.is_dir() {
+            return Err(PgEmbedError {
+                error_type: PgEmbedErrorType::InvalidPgPackage,
+                source: None,
+                message: Some(format!(
+                    "local binaries directory {} does not exist or is not a directory",
+                    dir.display()
+                )),
+            });
+        }
+        let missing: Vec<String> = ["initdb", "pg_ctl", "postgres"]
+            .iter()
+            .map(|name| format!("bin/{}{}", name, std::env::consts::EXE_SUFFIX))
+            .filter(|relative| !dir.join(relative).is_file())
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        Err(PgEmbedError {
+            error_type: PgEmbedErrorType::InvalidPgPackage,
+            source: None,
+            message: Some(format!(
+                "local binaries directory {} is missing executables: {}",
+                dir.display(),
+                missing.join(", ")
+            )),
         })
     }
 
@@ -369,5 +421,96 @@ impl PgAccess {
         }
 
         command
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Creates an installation tree with empty stand-in executables, minus `omit`.
+    fn fake_installation(omit: &[&str]) -> tempfile::TempDir {
+        let installation = tempfile::tempdir().unwrap();
+        let bin_dir = installation.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        for name in ["initdb", "pg_ctl", "postgres"] {
+            if omit.contains(&name) {
+                continue;
+            }
+            let executable = bin_dir.join(format!("{}{}", name, std::env::consts::EXE_SUFFIX));
+            std::fs::write(&executable, b"").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
+                    .unwrap();
+            }
+        }
+        installation
+    }
+
+    fn local_settings(dir: &Path) -> PgFetchSettings {
+        PgFetchSettings {
+            local_binaries_dir: Some(dir.to_path_buf()),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn valid_local_binaries_dir_is_used_without_acquisition() {
+        let installation = fake_installation(&[]);
+        let database = tempfile::tempdir().unwrap();
+        let access = PgAccess::new(
+            &local_settings(installation.path()),
+            &database.path().join("db"),
+        )
+        .await
+        .unwrap();
+        assert!(access.pg_ctl_exe.starts_with(installation.path()));
+        assert!(access.init_db_exe.starts_with(installation.path()));
+        assert!(!access.acquisition_needed().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn missing_postgres_executable_is_reported() {
+        let installation = fake_installation(&["postgres"]);
+        let database = tempfile::tempdir().unwrap();
+        let error = PgAccess::new(
+            &local_settings(installation.path()),
+            &database.path().join("db"),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(error.error_type, PgEmbedErrorType::InvalidPgPackage);
+        let message = error.message.unwrap();
+        assert!(message.contains("postgres"), "{}", message);
+        assert!(!message.contains("initdb"), "{}", message);
+    }
+
+    #[tokio::test]
+    async fn all_missing_executables_are_reported_together() {
+        let installation = fake_installation(&["initdb", "pg_ctl"]);
+        let message = PgAccess::validate_local_binaries_dir(installation.path())
+            .unwrap_err()
+            .message
+            .unwrap();
+        assert!(message.contains("initdb"), "{}", message);
+        assert!(message.contains("pg_ctl"), "{}", message);
+    }
+
+    #[tokio::test]
+    async fn nonexistent_local_binaries_dir_is_rejected() {
+        let parent = tempfile::tempdir().unwrap();
+        let database = tempfile::tempdir().unwrap();
+        let error = PgAccess::new(
+            &local_settings(&parent.path().join("does-not-exist")),
+            &database.path().join("db"),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(error.error_type, PgEmbedErrorType::InvalidPgPackage);
+        assert!(error.message.unwrap().contains("does not exist"));
     }
 }

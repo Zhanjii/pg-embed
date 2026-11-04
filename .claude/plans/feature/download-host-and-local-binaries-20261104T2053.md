@@ -30,16 +30,17 @@ InSync's current call sites must compile and behave unchanged:
 
 ## Checklist
 
-- [ ] 1. **Download URL + status error** (`src/pg_fetch.rs`). Sensitive: no
+- [x] 1. **Download URL + status error** (`src/pg_fetch.rs`). Sensitive: no
   - Add `pub fn download_url(&self) -> String` (host trailing-`/` trimmed; same path as today).
   - `fetch_postgres`: `log::debug!` the URL; transport error → `DownloadFailure` with message `"failed to download PostgreSQL binaries from {url}"` + source; non-success status → best-effort body, `log::warn!(url, status, body≤512B)`, return `DownloadFailure` with message `"downloading PostgreSQL binaries from {url} failed with HTTP status {status}"`; body-read failure → `ConversionFailure` with message naming the URL.
   - Doc comment on `host` that explains the Maven-layout requirement for mirrors.
-- [ ] 2. **`local_binaries_dir` setting** (`src/pg_fetch.rs`). Sensitive: no
+- [x] 2. **`local_binaries_dir` setting** (`src/pg_fetch.rs`). Sensitive: no
   - New `pub local_binaries_dir: Option<PathBuf>` with a doc comment (PG 15 tree containing `bin/`; must match `version`; skips download). `Default` → `None`.
-- [ ] 3. **Local-dir resolution + validation** (`src/pg_access.rs`). Sensitive: no
+- [x] 3. **Local-dir resolution + validation** (`src/pg_access.rs`). Sensitive: no
   - In `PgAccess::new`, when `local_binaries_dir` is `Some(dir)`: validate (LD-006), then set `pg_ctl_exe = dir/bin/pg_ctl`, `init_db_exe = dir/bin/initdb`. Otherwise unchanged.
   - A small private helper `fn validate_local_binaries_dir(dir: &Path) -> PgResult<()>` so it is unit-testable.
-- [ ] 4. **Tests**. Sensitive: no
+- [x] 4. **Tests**. Sensitive: no
+  - Note: local-mode `pg_ctl_exe`/`init_db_exe` carry `EXE_SUFFIX` (unlike the cache paths) because `pg_executables_cached()` opens `init_db_exe` as a file; without `.exe` a Windows local install would be seen as "not cached" and trigger a download. The cache-path behavior is unchanged.
   - Add dev-dependency `tempfile = "3"`.
   - `pg_fetch` unit tests: default-host URL for a fixed os/arch/`PG_V15`; custom host; host with trailing `/`.
   - `pg_fetch` unit tests with a one-shot local HTTP server (a `tokio::net::TcpListener` on `127.0.0.1:0` writing a canned response, no new deps): 404 → `Err(DownloadFailure)` whose message contains the URL and `404`; 500 likewise; 200 → `Ok` bytes equal to the body. No real network.
