@@ -153,6 +153,9 @@ Debian/Ubuntu (`/usr/lib/postgresql/15/bin` with `/usr/share/postgresql/15`) are
 one tree, or use the download path.
 
  ```rust
+ use pg_embed::pg_fetch::{PgFetchSettings, PG_V15};
+ use std::path::PathBuf;
+
  let fetch_settings = PgFetchSettings {
      version: PG_V15,
      local_binaries_dir: Some(PathBuf::from("/opt/my-app/postgres")),
