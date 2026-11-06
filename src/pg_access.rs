@@ -170,31 +170,12 @@ impl PgAccess {
             None => Self::create_cache_dir_structure(fetch_settings).await?,
         };
         Self::create_db_dir_structure(database_dir).await?;
-        // The executables come from the local installation when one is configured;
-        // pg_executables_cached() then sees initdb and no download is attempted.
-        // The exe suffix is included here (unlike the cache paths below) because
-        // pg_executables_cached() opens the path as a file, which needs ".exe" on Windows.
-        // Joined per component: a "bin/x" literal would mix separators on Windows, and
-        // pg_ctl hands this path to `cmd /C` when spawning postgres.
-        let (pg_ctl, init_db) = match &local_binaries_dir {
-            Some(local_binaries_dir) => (
-                local_binaries_dir
-                    .join("bin")
-                    .join(format!("pg_ctl{}", std::env::consts::EXE_SUFFIX)),
-                local_binaries_dir
-                    .join("bin")
-                    .join(format!("initdb{}", std::env::consts::EXE_SUFFIX)),
-            ),
-            None => {
-                // pg_ctl executable
-                let mut pg_ctl = cache_dir.clone();
-                pg_ctl.push("bin/pg_ctl");
-                // initdb executable
-                let mut init_db = cache_dir.clone();
-                init_db.push("bin/initdb");
-                (pg_ctl, init_db)
-            }
-        };
+        // Both modes resolve executables under cache_dir (the install dir in local mode).
+        // The exe suffix is included because pg_executables_cached() opens the path as a
+        // file, which needs ".exe" on Windows; without it download mode re-downloaded on
+        // every start there. Joined per component because pg_ctl hands this path to `cmd /C`.
+        let pg_ctl = Self::executable_path(&cache_dir, "pg_ctl");
+        let init_db = Self::executable_path(&cache_dir, "initdb");
         // postgres zip file
         let mut zip_file_path = cache_dir.clone();
         let platform = fetch_settings.platform();
@@ -218,6 +199,20 @@ impl PgAccess {
             local_binaries_dir,
             acquisition_owner_id: next_acquisition_owner_id(),
         })
+    }
+
+    /// Path of the executable `name` under `root`, with the platform's exe suffix
+    ///
+    /// The binaries-present check opens this path as a file, which needs ".exe" on Windows.
+    /// Joined per component so Windows paths keep a single separator style.
+    fn executable_path(root: &Path, name: &str) -> PathBuf {
+        Self::executable_path_with_suffix(root, name, std::env::consts::EXE_SUFFIX)
+    }
+
+    /// `executable_path` with an explicit suffix, so both the Windows and the
+    /// non-Windows case are testable on any host
+    fn executable_path_with_suffix(root: &Path, name: &str, suffix: &str) -> PathBuf {
+        root.join("bin").join(format!("{}{}", name, suffix))
     }
 
     ///
@@ -278,12 +273,11 @@ impl PgAccess {
         }
         let mut missing: Vec<String> = ["initdb", "pg_ctl", "postgres"]
             .iter()
-            .map(|name| format!("{}{}", name, std::env::consts::EXE_SUFFIX))
-            .filter_map(|file_name| {
-                // The label is for humans; the path is joined per component so Windows
-                // paths keep a single separator style.
-                let relative = format!("bin/{}", file_name);
-                let path = dir.join("bin").join(&file_name);
+            .filter_map(|name| {
+                // The label is for humans; the path comes from executable_path, which
+                // joins per component so Windows paths keep a single separator style.
+                let relative = format!("bin/{}{}", name, std::env::consts::EXE_SUFFIX);
+                let path = Self::executable_path(dir, name);
                 if !path.is_file() {
                     return Some(relative);
                 }
@@ -723,7 +717,7 @@ pub(crate) fn fake_installation(omit: &[&str]) -> tempfile::TempDir {
         if omit.contains(&name) {
             continue;
         }
-        let executable = bin_dir.join(format!("{}{}", name, std::env::consts::EXE_SUFFIX));
+        let executable = PgAccess::executable_path(installation.path(), name);
         std::fs::write(&executable, b"").unwrap();
         #[cfg(unix)]
         {
@@ -742,8 +736,8 @@ pub(crate) fn access_for(dir: &Path) -> PgAccess {
     PgAccess {
         cache_dir: dir.to_path_buf(),
         database_dir: dir.join("db"),
-        pg_ctl_exe: dir.join("bin").join("pg_ctl"),
-        init_db_exe: dir.join("bin").join("initdb"),
+        pg_ctl_exe: PgAccess::executable_path(dir, "pg_ctl"),
+        init_db_exe: PgAccess::executable_path(dir, "initdb"),
         pw_file_path: dir.join("db.pwfile"),
         zip_file_path: dir.join("binaries.zip"),
         pg_version_file: dir.join("db").join("PG_VERSION"),
@@ -761,6 +755,47 @@ mod tests {
             local_binaries_dir: Some(dir.to_path_buf()),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn executable_path_without_suffix_has_no_extension() {
+        let root = Path::new("root");
+        assert_eq!(
+            PgAccess::executable_path_with_suffix(root, "initdb", ""),
+            root.join("bin").join("initdb")
+        );
+    }
+
+    #[test]
+    fn executable_path_with_exe_suffix_ends_in_exe() {
+        let root = Path::new("root");
+        let path = PgAccess::executable_path_with_suffix(root, "initdb", ".exe");
+        assert_eq!(path, root.join("bin").join("initdb.exe"));
+        assert_eq!(path.file_name(), Some(std::ffi::OsStr::new("initdb.exe")));
+    }
+
+    #[test]
+    fn executable_path_uses_platform_suffix() {
+        let root = Path::new("root");
+        assert_eq!(
+            PgAccess::executable_path(root, "pg_ctl"),
+            PgAccess::executable_path_with_suffix(root, "pg_ctl", std::env::consts::EXE_SUFFIX)
+        );
+    }
+
+    #[tokio::test]
+    async fn download_mode_sees_cached_executables() {
+        let installation = fake_installation(&[]);
+        let access = access_for(installation.path());
+        assert!(access.pg_executables_cached().await.unwrap());
+        assert!(!access.acquisition_needed().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn download_mode_reports_missing_initdb_as_not_cached() {
+        let installation = fake_installation(&["initdb"]);
+        let access = access_for(installation.path());
+        assert!(!access.pg_executables_cached().await.unwrap());
     }
 
     #[tokio::test]

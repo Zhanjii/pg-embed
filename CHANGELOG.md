@@ -7,6 +7,7 @@ This fork is consumed by git rev, not by version, so `Cargo.toml` stays at 0.7.x
 - `PgFetchSettings::download_url()` exposes the download url; a trailing `/` on `host` is ignored
 
 ### Fix
+- On Windows, download mode now looks for `bin/initdb.exe` when deciding whether the binaries are already cached, so it no longer re-downloads and re-unpacks PostgreSQL on every start; `PgAccess.pg_ctl_exe` / `init_db_exe` include the `.exe` suffix on Windows in both modes (unchanged on other platforms)
 - A download answering with a non-success HTTP status now fails with `DownloadFailure` naming the url and status, instead of unpacking the error page as a zip
 - A failed or cancelled binaries acquisition no longer leaves its status "in progress", which made every other `PgEmbed` for the same cache directory in the process wait forever; after a failure, one of the waiting instances claims the retry and the others keep waiting (an instance starting its very first acquisition at the same moment can still overlap, as before)
 

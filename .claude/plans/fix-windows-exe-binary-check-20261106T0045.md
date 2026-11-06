@@ -41,12 +41,15 @@ instead of `cache\bin/initdb` — the exact form local mode already ships with (
 ## Checklist
 
 ### Fork PR (Zhanjii/pg-embed)
-- [ ] 1. Tests first: `executable_path_with_suffix` with `""` → `root/bin/initdb`, with `".exe"` → `root/bin/initdb.exe`;
+- [x] 1. Tests first: `executable_path_with_suffix` with `""` → `root/bin/initdb`, with `".exe"` → `root/bin/initdb.exe`;
       `pg_executables_cached()` true for `access_for(fake_installation(&[]))` and false with `initdb` omitted. Sensitive: no
-- [ ] 2. Add `executable_path` / `executable_path_with_suffix` to `PgAccess`; use in `new` (drop the mode `match`,
+- [x] 2. Add `executable_path` / `executable_path_with_suffix` to `PgAccess`; use in `new` (drop the mode `match`,
       keep the "why .exe" comment, now explaining both modes), `validate_local_binaries_dir`, `access_for`, `fake_installation`. Sensitive: no
-- [ ] 3. Gate: `bash .claude/validate.sh` (fmt, build, lib tests, clippy vs baseline) + `cargo check --target x86_64-pc-windows-msvc --all-targets`. Sensitive: no
-- [ ] 4. CHANGELOG entry if the file tracks fork changes (check first). Sensitive: no
+- [x] 3. Gate: `bash .claude/validate.sh` (fmt, build, lib tests, clippy vs baseline) + `cargo check --target x86_64-pc-windows-msvc --all-targets`. Sensitive: no
+      Result: validate.sh passed (48/48 lib tests, no new clippy). Windows check did not complete on this Mac: the
+      Homebrew `cargo`/`rustc` on PATH lacks the Windows std, and with rustup's toolchain forced first, `ring` and
+      `bzip2-sys` build scripts need an MSVC C toolchain. Non-gating per LD-P15-G-003; no crate code was reached.
+- [x] 4. CHANGELOG entry if the file tracks fork changes (check first). Sensitive: no — added under Unreleased → Fix.
 - [ ] 5. /challenge-loop → /create-pr against `fix/fsync-on` → merge on local gate (no fork CI; merge-on-green granted). Record merge sha.
 
 ### InSync PR (Zhanjii/claude-code-hook-dashboard)
