@@ -194,13 +194,18 @@ impl PgEmbed {
         {
             // "Binaries cached" is decided by the presence of initdb alone, so a tree that
             // failed part way through must not keep it or every later start would trust it.
-            if let Err(remove_error) = tokio::fs::remove_file(&self.pg_access.init_db_exe).await {
-                if remove_error.kind() != std::io::ErrorKind::NotFound {
-                    log::warn!(
-                        "could not remove {} after a failed unpack: {}",
-                        self.pg_access.init_db_exe.display(),
-                        remove_error
-                    );
+            // A cleanup failure means the tree is untouched or complete, so it is left alone.
+            // Synchronous, with no await since the failed extraction, so a cancellation
+            // cannot skip it.
+            if unpack_error.error_type != PgEmbedErrorType::PgCleanUpFailure {
+                if let Err(remove_error) = std::fs::remove_file(&self.pg_access.init_db_exe) {
+                    if remove_error.kind() != std::io::ErrorKind::NotFound {
+                        log::warn!(
+                            "could not remove {} after a failed unpack: {}",
+                            self.pg_access.init_db_exe.display(),
+                            remove_error
+                        );
+                    }
                 }
             }
             return Err(unpack_error);
