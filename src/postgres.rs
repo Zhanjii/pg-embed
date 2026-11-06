@@ -188,8 +188,23 @@ impl PgEmbed {
     async fn acquire_postgres_steps(&self) -> PgResult<()> {
         let pg_bin_data = &self.fetch_settings.fetch_postgres().await?;
         self.pg_access.write_pg_zip(&pg_bin_data).await?;
-        pg_unpack::unpack_postgres(&self.pg_access.zip_file_path, &self.pg_access.cache_dir)
-            .await?;
+        if let Err(unpack_error) =
+            pg_unpack::unpack_postgres(&self.pg_access.zip_file_path, &self.pg_access.cache_dir)
+                .await
+        {
+            // "Binaries cached" is decided by the presence of initdb alone, so a tree that
+            // failed part way through must not keep it or every later start would trust it.
+            if let Err(remove_error) = tokio::fs::remove_file(&self.pg_access.init_db_exe).await {
+                if remove_error.kind() != std::io::ErrorKind::NotFound {
+                    log::warn!(
+                        "could not remove {} after a failed unpack: {}",
+                        self.pg_access.init_db_exe.display(),
+                        remove_error
+                    );
+                }
+            }
+            return Err(unpack_error);
+        }
         self.pg_access.mark_acquisition_finished().await?;
         Ok(())
     }
@@ -519,6 +534,49 @@ mod tests {
                 == crate::pg_enums::PgAcquisitionStatus::Undefined
         );
         assert!(zip_files_under(&cache_dir).is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_unpack_invalidates_partial_tree_and_resets_status() {
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let cache_dir = temporary_directory.path().join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let host = crate::pg_fetch::serve_once(
+            "200 OK",
+            crate::pg_unpack::test_archives::postgres_zip(true),
+        )
+        .await;
+        // A struct literal: PgEmbed::new in remote mode would create the real user cache.
+        let mut pg = PgEmbed {
+            pg_settings: settings_for(temporary_directory.path().join("db")),
+            fetch_settings: PgFetchSettings {
+                host,
+                ..Default::default()
+            },
+            db_uri: "postgres://postgres:password@localhost:5432".to_string(),
+            server_status: Arc::new(Mutex::new(PgServerStatus::Uninitialized)),
+            shutting_down: false,
+            pg_access: crate::pg_access::access_for(&cache_dir),
+        };
+        // Drop must neither run pg_ctl nor clean anything up.
+        pg.shutting_down = true;
+        pg.pg_settings.persistent = true;
+
+        let error = pg.acquire_postgres().await.unwrap_err();
+        assert_eq!(
+            error.error_type,
+            PgEmbedErrorType::UnpackFailure,
+            "{:?}",
+            error
+        );
+        // The first tar entry (initdb) was fully extracted before the failure.
+        assert!(!pg.pg_access.init_db_exe.exists());
+        assert!(!pg.pg_access.pg_executables_cached().await.unwrap());
+        assert!(
+            pg.pg_access.acquisition_status().await
+                == crate::pg_enums::PgAcquisitionStatus::Undefined
+        );
+        assert!(pg.pg_access.acquisition_needed().await.unwrap());
     }
 
     // End to end for the claim guard: a timeout around acquisition (the typical way callers

@@ -587,6 +587,15 @@ impl PgAccess {
                 message: None,
             })
             .await?;
+        // tokio's File finishes the last write on a blocking thread after write_all returns;
+        // without the flush, unpacking (which reads the zip synchronously) can see a short file.
+        file.flush()
+            .map_err(|e| PgEmbedError {
+                error_type: PgEmbedErrorType::WriteFileError,
+                source: Some(Box::new(e)),
+                message: None,
+            })
+            .await?;
         Ok(())
     }
 
