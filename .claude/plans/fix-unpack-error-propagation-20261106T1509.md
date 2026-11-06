@@ -47,6 +47,13 @@ now affected.
 - LD-P15-Q2-005: Test fixtures are built in-test with `tar` 0.4 + `xz2` 0.1 as **dev-dependencies**
   (the versions `archiver-rs` 0.5 already pulls in, so no new crates resolve) plus the existing
   `zip` 0.5 dependency. No binary fixtures are committed.
+- LD-P15-Q2-006 (added during execution): `PgAccess::write_pg_zip` now `flush()`es after
+  `write_all`. The vertical test failed about 1 in 20 runs under parallel load with `ReadFileError:
+  Invalid zip header`. tokio's `File` completes the last write on a blocking thread after
+  `write_all` returns, and nothing flushed before `unzip_txz` opened the zip synchronously. 180
+  stressed runs were clean with the flush. This is on the path that produces the archive that
+  unpack reads, and it is a one-line fix. Without it the new test is flaky and production's first
+  acquisition can spuriously fail (with this PR, cleanly, and the next start retries).
 - LD-P15-Q2-REVIEWBAR: BLOCKER only: a corrupt archive still yields a trusted tree, a good
   archive now fails, macOS/Linux/Windows paths change, or the InSync pin breaks a build.
   Pre-existing upstream limits are NITs. Converge.
@@ -63,7 +70,7 @@ now affected.
 ## Checklist
 
 ### Fork PR (Zhanjii/pg-embed → `fix/fsync-on`)
-- [ ] 1. Tests first (they must fail before the fix). A shared test helper builds a zip ⊃ `.txz`
+- [x] 1. Tests first (they must fail before the fix). A shared test helper builds a zip ⊃ `.txz`
       ⊃ tar whose first entry is `bin/initdb<EXE_SUFFIX>` (complete) and whose second entry is
       cut off mid-data. Sensitive: no
   - `pg_unpack` unit test: `unpack_postgres` on that zip returns `Err` with
@@ -74,9 +81,9 @@ now affected.
     `acquire_postgres()` errs with `UnpackFailure`. Afterwards `init_db_exe` does not exist,
     `pg_executables_cached()` is false, the status is `Undefined`, and `acquisition_needed()`
     is true.
-- [ ] 2. `pg_unpack.rs`: propagate the `decompress_tar` result after the `.tar` cleanup (Design 1). Sensitive: no
-- [ ] 3. `postgres.rs`: delete `init_db_exe` when unpacking fails, then return the error (Design 2). Sensitive: no
-- [ ] 4. `Cargo.toml` dev-deps `tar = "0.4"`, `xz2 = "0.1"`; CHANGELOG Unreleased → Fix entry. Sensitive: no
+- [x] 2. `pg_unpack.rs`: propagate the `decompress_tar` result after the `.tar` cleanup (Design 1). Sensitive: no
+- [x] 3. `postgres.rs`: delete `init_db_exe` when unpacking fails, then return the error (Design 2). Sensitive: no
+- [x] 4. `Cargo.toml` dev-deps `tar = "0.4"`, `xz2 = "0.1"`; CHANGELOG Unreleased → Fix entry. Sensitive: no
 - [ ] 5. Gate: `bash .claude/validate.sh` (fmt, build, lib tests, no new clippy vs baseline). Never run `tests/` or `purge()`. Sensitive: no
 - [ ] 6. `/challenge-loop` with the review bar above; PR against `fix/fsync-on`; merge on the local gate (no fork CI). Record the merge sha. Sensitive: no
 
