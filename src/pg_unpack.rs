@@ -110,14 +110,14 @@ pub async fn unpack_postgres(zip_file_path: &PathBuf, cache_dir: &PathBuf) -> Pg
         .await?;
     let extraction_result = decompress_tar(&tar_file_path, &cache_dir);
     // The tar is removed whatever the extraction result, so a failure does not leave a
-    // large intermediate behind.
-    let cleanup_result = tokio::fs::remove_file(tar_file_path)
-        .map_err(|e| PgEmbedError {
-            error_type: PgEmbedErrorType::PgCleanUpFailure,
-            source: Some(Box::new(e)),
-            message: None,
-        })
-        .await;
+    // large intermediate behind. Synchronously, like the extraction itself: an await here
+    // would let a cancellation (e.g. a timeout around setup()) drop the future between a
+    // failed extraction and the caller's invalidation of the partial tree.
+    let cleanup_result = std::fs::remove_file(tar_file_path).map_err(|e| PgEmbedError {
+        error_type: PgEmbedErrorType::PgCleanUpFailure,
+        source: Some(Box::new(e)),
+        message: None,
+    });
     match (extraction_result, cleanup_result) {
         (Err(extraction_error), cleanup_result) => {
             // The extraction error is the root cause; a cleanup error must not mask it.

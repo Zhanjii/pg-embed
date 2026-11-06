@@ -64,6 +64,12 @@ now affected.
   end of archive in the `tar` crate. Reaching that state needs an xz stream that decodes
   cleanly, and xz's integrity check plus the zip CRC make that implausible for a corrupted
   download.
+- A process killed during the synchronous extraction (quit or crash on first start) still
+  leaves a trusted partial tree. Only a staging dir could close that, and LD-P15-Q2-003 rules
+  one out. This PR closes the failed-extraction path, not every partial-tree path.
+- Challenge iteration 2: the `.tar` cleanup and the `initdb` removal are synchronous, so no
+  await separates a failed extraction from the invalidation and a cancellation can't skip it.
+  A `PgCleanUpFailure` doesn't invalidate, because the tree is then untouched or complete.
 - The integration tests in `tests/` are not run: they call `purge()`, which deletes the real
   `~/Library/Caches/pg-embed`.
 
