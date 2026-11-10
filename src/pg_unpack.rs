@@ -2,7 +2,7 @@
 //! Unpack postgresql binaries
 //!
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use archiver_rs::{Archive, Compressed};
 use futures::TryFutureExt;
@@ -21,8 +21,12 @@ use crate::pg_types::PgResult;
 pub(crate) const UNPACK_STAGING_DIR_PREFIX: &str = ".unpack-staging-";
 
 /// Source of the per-run part of a staging dir name; only uniqueness matters, so Relaxed
-/// suffices.
-static NEXT_UNPACK_STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+/// suffices. `usize` because 64-bit atomics are missing on some 32-bit targets.
+static NEXT_UNPACK_STAGING_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
+/// Folder inside a run's staging dir that the cache dir entries being replaced are renamed
+/// into before they are deleted; see `move_staged_tree_into_place`.
+const REPLACED_ENTRIES_DIR_NAME: &str = ".replaced-entries";
 
 /// Serializes the move phase of overlapping runs in this process; see
 /// `move_staged_tree_into_place`.
@@ -65,7 +69,9 @@ fn staging_dir_owner_pid(entry_name: &std::ffi::OsStr) -> Option<u32> {
 /// failed run removes its own. One named with this process's pid belongs to a live peer
 /// acquisition and is never touched. Overlapping acquisitions of one cache dir from two
 /// processes stay unsupported, as upstream: they already share the zip, `.txz` and `.tar`
-/// paths, and this would remove the live peer's staging dir.
+/// paths, and this would remove the live peer's staging dir. The tar extractor recreates
+/// missing parent dirs, so that peer could then move a tree with holes into place, and it
+/// would be trusted.
 ///
 /// Returns `Ok(())` on success, otherwise returns an error.
 ///
@@ -232,40 +238,80 @@ fn move_staged_tree_into_place(staging_dir: &Path, cache_dir: &Path) -> PgResult
             .map_err(|e| unpack_failure(e, format!("could not list {}", staging_dir.display())))?;
         entry_names.push(entry.file_name());
     }
-    // initdb is the only presence marker, so `bin` goes last: a kill at any earlier point
+    // initdb is the only presence marker, so `bin` goes in last: a kill at any earlier point
     // leaves no `cache_dir/bin/initdb` and the next start acquires again.
-    entry_names.sort_by_key(|name| name == "bin");
+    let moves_bin = entry_names.iter().any(|name| name == "bin");
+    entry_names.retain(|name| name != "bin");
+    // Replaced entries are renamed into this run's staging dir and deleted there, because an
+    // in-place delete is not atomic: a kill partway through could leave `bin/initdb` next to
+    // already deleted binaries, and that tree would be trusted. A kill after the rename
+    // leaves the old entry inside a staging dir, which the leftover cleanup removes.
+    // `create_dir` fails if the archive itself has an entry of that name, so the two can
+    // never mix.
+    let replaced_entries_dir = staging_dir.join(REPLACED_ENTRIES_DIR_NAME);
     // No trusted partial tree when two runs in this process overlap: the lock keeps one run's
-    // removals from opening a hole in the tree the other has just completed with `bin`, and
-    // the old `bin` goes first so initdb is absent while any entry is being replaced. A
-    // failure anywhere here is an UnpackFailure with initdb absent, so the next start
-    // re-downloads. The lock is never held across an await. A poisoned lock only means a
-    // peer panicked mid-move, which this run's full replacement repairs.
+    // replacements from opening a hole in the tree the other has just completed with `bin`,
+    // and the old `bin` goes first so initdb is absent while any entry is being replaced. A
+    // failure anywhere before the `bin` rename is an UnpackFailure with initdb absent, so the
+    // next start re-downloads. The lock is never held across an await. A poisoned lock only
+    // means a peer panicked mid-move, which this run's full replacement repairs.
     let _move_guard = MOVE_INTO_PLACE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if entry_names.iter().any(|name| name == "bin") {
-        remove_path_if_present(&cache_dir.join("bin"))?;
+    std::fs::create_dir(&replaced_entries_dir).map_err(|e| {
+        unpack_failure(
+            e,
+            format!("could not create {}", replaced_entries_dir.display()),
+        )
+    })?;
+    if moves_bin {
+        move_existing_entry_away(&cache_dir.join("bin"), &replaced_entries_dir.join("bin"))?;
     }
     for entry_name in entry_names {
-        let source = staging_dir.join(&entry_name);
-        let destination = cache_dir.join(&entry_name);
         // Left by a run killed during this move, or by a pre-staging partial tree. A dir
         // rename onto an existing dir fails on Windows, and onto a non-empty one on Unix.
-        remove_path_if_present(&destination)?;
-        std::fs::rename(&source, &destination).map_err(|e| {
-            unpack_failure(
-                e,
-                format!(
-                    "could not move {} to {}",
-                    source.display(),
-                    destination.display()
-                ),
-            )
-        })?;
+        move_existing_entry_away(
+            &cache_dir.join(&entry_name),
+            &replaced_entries_dir.join(&entry_name),
+        )?;
+        rename_entry(&staging_dir.join(&entry_name), &cache_dir.join(&entry_name))?;
+    }
+    remove_path_if_present(&replaced_entries_dir)?;
+    if moves_bin {
+        rename_entry(&staging_dir.join("bin"), &cache_dir.join("bin"))?;
     }
     std::fs::remove_dir(staging_dir)
         .map_err(|e| unpack_failure(e, format!("could not remove {}", staging_dir.display())))
+}
+
+///
+/// Rename `source` to `destination`, as an `UnpackFailure` naming both on error
+///
+fn rename_entry(source: &Path, destination: &Path) -> PgResult<()> {
+    std::fs::rename(source, destination).map_err(|e| {
+        unpack_failure(
+            e,
+            format!(
+                "could not move {} to {}",
+                source.display(),
+                destination.display()
+            ),
+        )
+    })
+}
+
+///
+/// Rename an existing cache dir entry into the replaced-entries dir, if it exists
+///
+fn move_existing_entry_away(existing_entry: &Path, replaced_entry: &Path) -> PgResult<()> {
+    match std::fs::symlink_metadata(existing_entry) {
+        Ok(_) => rename_entry(existing_entry, replaced_entry),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(unpack_failure(
+            error,
+            format!("could not inspect {}", existing_entry.display()),
+        )),
+    }
 }
 
 ///
@@ -543,6 +589,22 @@ mod tests {
         unpack_postgres(&zip_file_path, &cache_dir).await.unwrap();
         assert_complete_tree(&cache_dir);
         assert!(!cache_dir.join("lib").join("stale-file").exists());
+    }
+
+    // A complete cache from a prior run being replaced: the old `bin` is renamed away whole
+    // rather than deleted in place, so no kill can leave its initdb next to missing binaries.
+    #[tokio::test]
+    async fn unpack_postgres_replaces_a_complete_bin_from_a_prior_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().to_path_buf();
+        std::fs::create_dir_all(cache_dir.join("bin")).unwrap();
+        std::fs::write(initdb_path(&cache_dir), b"old initdb").unwrap();
+        std::fs::write(cache_dir.join("bin").join("stale-binary"), b"stale").unwrap();
+        let zip_file_path = write_good_zip(&cache_dir);
+
+        unpack_postgres(&zip_file_path, &cache_dir).await.unwrap();
+        assert_complete_tree(&cache_dir);
+        assert!(!cache_dir.join("bin").join("stale-binary").exists());
     }
 
     fn initdb_path(root: &std::path::Path) -> PathBuf {

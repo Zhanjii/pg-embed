@@ -16,30 +16,36 @@ start trusts the partial tree (LD-P15-Q2-003, Known limits of pg-embed#4).
 
 1. **Extract into a staging dir.** `unpack_postgres` extracts the tar into its own
    `cache_dir/.unpack-staging-<pid>-<seq>` (prefix constant `UNPACK_STAGING_DIR_PREFIX`; `seq`
-   from a process-wide `AtomicU64`), not into `cache_dir`. It sits inside `cache_dir`, so it is
-   on the same volume and `rename` is a metadata move on macOS/Linux/Windows.
-   `pg_executables_cached()` never looks inside it.
-2. **Clean leftovers first.** `remove_leftover_staging_dirs` removes every staging dir in
-   `cache_dir` named with another pid (only a killed process leaves one); same-pid and malformed
-   names are left alone. `acquire_postgres_steps` runs it before the download, and
-   `unpack_postgres` again for direct callers; a failure is logged, not returned. A leftover is
-   therefore ignored by the presence check and cleaned by the next acquire. A failed run removes
-   its own staging dir.
-3. **Move into place, `bin` last.** After a successful extraction, every top-level entry of the
-   staging dir is renamed into `cache_dir`. An existing destination entry (left by a run killed
-   during this move phase, or by a pre-fix partial tree) is removed first: `remove_dir_all` for a
-   dir, `remove_file` otherwise, since a dir rename onto an existing dir fails on Windows and onto
-   a non-empty one on Unix. `bin` is moved after every other entry. `initdb` is the only presence
-   marker, so it appears in `cache_dir` only once everything else is in place. A kill at any point
-   before the `bin` rename leaves no `cache_dir/bin/initdb`, and the next start re-acquires. Then
-   the now-empty staging dir is removed.
+   from a process-wide `AtomicUsize`, since 64-bit atomics are missing on some 32-bit targets),
+   not into `cache_dir`. The name is per run so overlapping in-process runs never share one. It
+   sits inside `cache_dir`, so it is on the same volume and `rename` is a metadata move on
+   macOS/Linux/Windows. `pg_executables_cached()` never looks inside it.
+2. **Clean other-pid leftovers first.** `remove_leftover_staging_dirs` removes every staging dir
+   in `cache_dir` named with another pid (only a killed process leaves one); same-pid (a live
+   in-process peer's) and malformed names are left alone. It runs at the start of
+   `acquire_postgres_steps`, before the download, and again in `unpack_postgres` for direct
+   callers. It is warn-only: a failure is logged, not returned, since a leftover costs disk
+   space, never correctness.
+3. **Move into place, old `bin` away first, new `bin` last.** After a successful extraction the
+   move phase runs under a process-wide lock. It creates `<staging_dir>/.replaced-entries`
+   (`create_dir` fails if the archive itself has that name), then renames the existing
+   `cache_dir/bin` into it in one atomic rename, so initdb vanishes at once and never sits next
+   to half-deleted binaries. Each other top-level staging entry then has its existing
+   destination (left by a run killed during this phase, by a pre-fix partial tree, or by a
+   complete prior tree) renamed into `.replaced-entries` and is renamed into `cache_dir`. Then
+   `.replaced-entries` is deleted, the new `bin` is renamed in, and the now-empty staging dir is
+   removed. A kill after any rename into `.replaced-entries` leaves the old entry inside a
+   staging dir, which the leftover cleanup removes. `initdb` is the only presence marker, so a
+   kill at any point before the final `bin` rename leaves no `cache_dir/bin/initdb`, and the
+   next start re-acquires.
 4. **Synchronous.** Cleanup, extraction and moves are all `std::fs`, with no await in between
-   (the same cancellation reasoning as pg-embed#4).
-5. **Errors.** A failed staging cleanup or a failed move is `UnpackFailure` with the path in
-   `message`. A failed extraction keeps pg-embed#4's behaviour: the `.tar` is removed, the
-   extraction error wins, and the staging dir is left for the next acquire to clean. The
-   `init_db_exe` invalidation in `acquire_postgres_steps` stays as it is (now normally `NotFound`,
-   kept as defence in depth).
+   (the same cancellation reasoning as pg-embed#4). The move lock is never held across an await.
+5. **Errors.** A failed staging cleanup in the move phase or a failed move is `UnpackFailure`
+   with the path in `message`. A failed extraction keeps pg-embed#4's behaviour: the `.tar` is
+   removed and the extraction error wins. A failed extraction or move removes its own staging
+   dir (a failure there is logged, so the original error is returned). The `init_db_exe`
+   invalidation in `acquire_postgres_steps` stays as it is (now normally `NotFound`, kept as
+   defence in depth).
 
 ## Locked decisions
 
@@ -88,7 +94,12 @@ start trusts the partial tree (LD-P15-Q2-003, Known limits of pg-embed#4).
   surfaces as `UnpackFailure`, the status resets, and the next start retries.
 - Overlapping acquisitions of one cache dir from two processes are unsupported, as upstream:
   they share the zip, `.txz` and `.tar` paths, and the other-pid staging dir of a live process
-  would be removed by the leftover cleanup.
+  would be removed by the leftover cleanup. The tar extractor recreates missing parent dirs, so
+  that process could then move a tree with holes into place, and it would be trusted.
+- If in-process runs overlap after a peer has finished and a `postgres` from that tree is
+  running, this run replaces `bin`/`lib` underneath it. Unix survives that; on Windows the
+  replacement can fail on in-use files, giving `UnpackFailure` and a re-download on the next
+  start, never a trusted partial tree.
 - Pid reuse can leave a leftover uncleaned (a later process with the same pid treats it as a
   live peer's). That is a disk-space leak, never a trusted tree.
 - No fsync of the extracted files or the renames: after an OS crash or power loss a persisted
@@ -106,14 +117,15 @@ start trusts the partial tree (LD-P15-Q2-003, Known limits of pg-embed#4).
     `.tar`/`.txz`, and now leaves **no** `cache_dir/bin/initdb` (the existing test's premise
     flips: the partial tree is in staging).
   - `pg_unpack` unit test: the good archive unpacks to `cache_dir/bin/initdb` + `cache_dir/lib/libfake`
-    (full length) and leaves no `.unpack-staging`, `.tar` or `.txz`.
-  - `pg_unpack` unit test (killed during extraction): pre-seed `cache_dir/.unpack-staging/bin/initdb`
-    plus a stale file, then `unpack_postgres` a good archive: `Ok`, the stale file is gone and the
-    tree is complete.
+    (full length) and leaves no `.unpack-staging-<pid>-<seq>`, `.tar` or `.txz`.
+  - `pg_unpack` unit test (killed during extraction): pre-seed another pid's
+    `cache_dir/.unpack-staging-<pid>-<seq>/bin/initdb` plus a stale file, then `unpack_postgres`
+    a good archive: `Ok`, the stale file is gone and the tree is complete.
   - `pg_unpack` unit test (killed during the move phase): pre-seed `cache_dir/lib/` holding a stale
     file plus a leftover staging dir, with no `cache_dir/bin`. A good archive unpacks `Ok` and
     `lib` is replaced (stale file gone, `libfake` full length).
-  - `postgres.rs` vertical test: a cache holding only a leftover `.unpack-staging/bin/initdb<EXE_SUFFIX>`
+  - `postgres.rs` vertical test: a cache holding only another pid's leftover
+    `.unpack-staging-<pid>-<seq>/bin/initdb<EXE_SUFFIX>`
     gives `pg_executables_cached()` false and `acquisition_needed()` true. Then `acquire_postgres()`
     with `serve_once("200 OK", good zip)` is `Ok`, `init_db_exe` exists, the staging dir is gone,
     and the status is `Finished`.
