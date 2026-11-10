@@ -105,7 +105,9 @@ start trusts the partial tree (LD-P15-Q2-003, Known limits of pg-embed#4).
 - [x] 4. CHANGELOG Unreleased → Fix entry. Sensitive: no
 - [x] 5. Gate: `bash .claude/validate.sh` (55/55 lib tests, 5 new) (fmt, build, lib tests, no new clippy vs baseline).
       Never run `tests/` or `purge()`. Sensitive: no
-- [ ] 6. Real-archive check, read-only, in a scratch dir: download the PG 15.1.0 darwin-amd64
+- [x] 6. (Done: top level `bin`, `lib`, `share` plus the zip, no staging dir, 18 `lib` symlinks
+      with 0 broken, `initdb --version` = PostgreSQL 15.1; probe reverted, scratch deleted.)
+      Real-archive check, read-only, in a scratch dir: download the PG 15.1.0 darwin-amd64
       zip from Maven into a scratch dir (never read or write `~/Library/Caches/pg-embed`) and run
       it through `unpack_postgres` with a temporary probe (reverted). Expect `Ok`, `bin/initdb`,
       the dylib symlinks resolving, and no `.unpack-staging`. Sensitive: no
