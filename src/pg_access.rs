@@ -807,7 +807,7 @@ mod tests {
         let installation = fake_installation(&[]);
         let staging_dir = installation
             .path()
-            .join(crate::pg_unpack::UNPACK_STAGING_DIR_NAME);
+            .join(crate::pg_unpack::test_archives::killed_process_staging_dir_name());
         std::fs::create_dir_all(staging_dir.join("bin")).unwrap();
         let access = access_for(installation.path());
         assert!(access.pg_executables_cached().await.unwrap());

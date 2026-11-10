@@ -2,6 +2,7 @@
 //! Unpack postgresql binaries
 //!
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use archiver_rs::{Archive, Compressed};
 use futures::TryFutureExt;
@@ -9,12 +10,87 @@ use futures::TryFutureExt;
 use crate::pg_errors::{PgEmbedError, PgEmbedErrorType};
 use crate::pg_types::PgResult;
 
-/// Folder inside the cache dir the tar is extracted into before its entries are moved into
-/// place. The cache counts as complete once `bin/initdb` exists, so extracting straight into
-/// the cache dir let a process killed mid-extraction leave a partial tree every later start
-/// trusted. Inside the cache dir it stays on the same volume (a rename is a metadata move)
-/// and adds no path outside the folder pg-embed owns.
-pub(crate) const UNPACK_STAGING_DIR_NAME: &str = ".unpack-staging";
+/// Name prefix of the folders inside the cache dir the tar is extracted into before its
+/// entries are moved into place; each run's folder is `<prefix><pid>-<seq>`. The cache counts
+/// as complete once `bin/initdb` exists, so extracting straight into the cache dir let a
+/// process killed mid-extraction leave a partial tree every later start trusted. Inside the
+/// cache dir it stays on the same volume (a rename is a metadata move) and adds no path
+/// outside the folder pg-embed owns. The name is per run because two first acquisitions of
+/// one cache dir can overlap in a process, and a shared folder let one run's cleanup delete
+/// the other's half-written tree, which was then moved into place and trusted.
+pub(crate) const UNPACK_STAGING_DIR_PREFIX: &str = ".unpack-staging-";
+
+/// Source of the per-run part of a staging dir name; only uniqueness matters, so Relaxed
+/// suffices.
+static NEXT_UNPACK_STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Serializes the move phase of overlapping runs in this process; see
+/// `move_staged_tree_into_place`.
+static MOVE_INTO_PLACE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+///
+/// Path of a fresh staging dir for this run, unique within the process and across processes
+///
+fn new_unpack_staging_dir(cache_dir: &Path) -> PathBuf {
+    let sequence = NEXT_UNPACK_STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    cache_dir.join(format!(
+        "{}{}-{}",
+        UNPACK_STAGING_DIR_PREFIX,
+        std::process::id(),
+        sequence
+    ))
+}
+
+///
+/// The pid in a staging dir name, or `None` for any other name
+///
+/// Anything after the prefix that is not `<digits>-<rest>` is treated as not ours to judge.
+///
+fn staging_dir_owner_pid(entry_name: &std::ffi::OsStr) -> Option<u32> {
+    let after_prefix = entry_name
+        .to_str()?
+        .strip_prefix(UNPACK_STAGING_DIR_PREFIX)?;
+    let (pid, _) = after_prefix.split_once('-')?;
+    if pid.is_empty() || !pid.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    pid.parse().ok()
+}
+
+///
+/// Remove the staging dirs other processes left in the cache dir
+///
+/// A staging dir named with another pid can only come from a process that was killed: a
+/// cancelled future cannot leave one, since extraction and the moves are synchronous, and a
+/// failed run removes its own. One named with this process's pid belongs to a live peer
+/// acquisition and is never touched. Overlapping acquisitions of one cache dir from two
+/// processes stay unsupported, as upstream: they already share the zip, `.txz` and `.tar`
+/// paths, and this would remove the live peer's staging dir.
+///
+/// Returns `Ok(())` on success, otherwise returns an error.
+///
+pub(crate) fn remove_leftover_staging_dirs(cache_dir: &Path) -> PgResult<()> {
+    let entries = match std::fs::read_dir(cache_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(unpack_failure(
+                error,
+                format!("could not list {}", cache_dir.display()),
+            ))
+        }
+    };
+    let own_pid = std::process::id();
+    for entry in entries {
+        let entry = entry
+            .map_err(|e| unpack_failure(e, format!("could not list {}", cache_dir.display())))?;
+        match staging_dir_owner_pid(&entry.file_name()) {
+            Some(owner_pid) if owner_pid != own_pid => remove_path_if_present(&entry.path())?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
 
 ///
 /// Unzip the postgresql txz file
@@ -100,6 +176,9 @@ fn decompress_tar(file_path: &PathBuf, cache_dir: &PathBuf) -> Result<(), PgEmbe
     Ok(())
 }
 
+///
+/// An `UnpackFailure` carrying the io error and the path it concerns
+///
 fn unpack_failure(error: std::io::Error, message: String) -> PgEmbedError {
     PgEmbedError {
         error_type: PgEmbedErrorType::UnpackFailure,
@@ -156,6 +235,18 @@ fn move_staged_tree_into_place(staging_dir: &Path, cache_dir: &Path) -> PgResult
     // initdb is the only presence marker, so `bin` goes last: a kill at any earlier point
     // leaves no `cache_dir/bin/initdb` and the next start acquires again.
     entry_names.sort_by_key(|name| name == "bin");
+    // No trusted partial tree when two runs in this process overlap: the lock keeps one run's
+    // removals from opening a hole in the tree the other has just completed with `bin`, and
+    // the old `bin` goes first so initdb is absent while any entry is being replaced. A
+    // failure anywhere here is an UnpackFailure with initdb absent, so the next start
+    // re-downloads. The lock is never held across an await. A poisoned lock only means a
+    // peer panicked mid-move, which this run's full replacement repairs.
+    let _move_guard = MOVE_INTO_PLACE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if entry_names.iter().any(|name| name == "bin") {
+        remove_path_if_present(&cache_dir.join("bin"))?;
+    }
     for entry_name in entry_names {
         let source = staging_dir.join(&entry_name);
         let destination = cache_dir.join(&entry_name);
@@ -178,16 +269,38 @@ fn move_staged_tree_into_place(staging_dir: &Path, cache_dir: &Path) -> PgResult
 }
 
 ///
+/// Remove this run's staging dir after its extraction or move failed
+///
+/// The leftover cleanup never touches a staging dir of this process, so without this a
+/// failed run would hold its partial tree on disk until the process exits and is restarted.
+/// A failure is logged rather than returned: the caller needs the original error.
+///
+fn remove_own_staging_dir(staging_dir: &Path) {
+    if let Err(error) = remove_path_if_present(staging_dir) {
+        log::warn!(
+            "could not remove the staging dir after a failed unpack: {}",
+            error
+        );
+    }
+}
+
+///
 /// Unpack the postgresql executables
 ///
 /// Returns `Ok(())` on success, otherwise returns an error.
 ///
 pub async fn unpack_postgres(zip_file_path: &PathBuf, cache_dir: &PathBuf) -> PgResult<()> {
     // The tar is extracted into a staging dir, out of the presence check's sight, so a process
-    // killed mid-extraction leaves nothing a later start trusts. A leftover from such a kill
-    // is cleared here, before it could mix with this extraction.
-    let staging_dir = cache_dir.join(UNPACK_STAGING_DIR_NAME);
-    remove_path_if_present(&staging_dir)?;
+    // killed mid-extraction leaves nothing a later start trusts. acquire_postgres has already
+    // cleared leftovers before downloading; this repeat covers direct callers of this pub fn.
+    // A failure only costs disk space (see acquire_postgres_steps), so it is logged.
+    if let Err(error) = remove_leftover_staging_dirs(cache_dir) {
+        log::warn!(
+            "could not remove a staging dir left by a killed unpack: {}",
+            error
+        );
+    }
+    let staging_dir = new_unpack_staging_dir(cache_dir);
     let txz_file_path = unzip_txz(&zip_file_path, &cache_dir)?;
     let tar_file_path = decompress_xz(&txz_file_path)?;
     tokio::fs::remove_file(txz_file_path)
@@ -209,14 +322,14 @@ pub async fn unpack_postgres(zip_file_path: &PathBuf, cache_dir: &PathBuf) -> Pg
     });
     match (extraction_result, cleanup_result) {
         (Err(extraction_error), cleanup_result) => {
-            // The extraction error is the root cause; a cleanup error must not mask it. The
-            // partial tree stays in the staging dir for the next acquisition to clear.
+            // The extraction error is the root cause; a cleanup error must not mask it.
             if let Err(cleanup_error) = cleanup_result {
                 log::warn!(
                     "could not remove the postgres tar file after a failed extraction: {}",
                     cleanup_error
                 );
             }
+            remove_own_staging_dir(&staging_dir);
             Err(extraction_error)
         }
         (Ok(()), cleanup_result) => {
@@ -230,6 +343,7 @@ pub async fn unpack_postgres(zip_file_path: &PathBuf, cache_dir: &PathBuf) -> Pg
                         cleanup_error
                     );
                 }
+                remove_own_staging_dir(&staging_dir);
                 return Err(move_error);
             }
             cleanup_result
@@ -282,6 +396,23 @@ pub(crate) mod test_archives {
         zip_writer.write_all(&txz_bytes).unwrap();
         zip_writer.finish().unwrap().into_inner()
     }
+
+    /// Name of a staging dir left by a killed process. u32::MAX is never a real pid here
+    /// (Linux caps pids at 2^22, macOS below 100000, Windows uses multiples of 4), so it can
+    /// never be this process's pid.
+    pub(crate) fn killed_process_staging_dir_name() -> String {
+        assert_ne!(std::process::id(), u32::MAX);
+        format!("{}{}-0", super::UNPACK_STAGING_DIR_PREFIX, u32::MAX)
+    }
+
+    /// Top-level entries of `cache_dir` named like a staging dir, of any pid.
+    pub(crate) fn staging_dir_names(cache_dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(cache_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(super::UNPACK_STAGING_DIR_PREFIX))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -312,11 +443,61 @@ mod tests {
             "{:?}",
             error
         );
-        // The partial tree (initdb included) stays in the staging dir, out of the presence check.
+        // The partial tree (initdb included) was extracted into the staging dir, out of the
+        // presence check, and removed with it.
         assert!(!initdb_path(&cache_dir).exists());
         // decompress_xz names the intermediate `<name>..tar` (with_extension(".tar")).
         assert!(files_with_extension(&cache_dir, ".tar").is_empty());
         assert!(files_with_extension(&cache_dir, ".txz").is_empty());
+    }
+
+    // A live process never runs the leftover cleanup on its own staging dirs, so a failed run
+    // that kept its dir would leak hundreds of MB for as long as the process lives.
+    #[tokio::test]
+    async fn failed_unpack_postgres_removes_its_own_staging_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().to_path_buf();
+        let zip_file_path = cache_dir.join("binaries.zip");
+        std::fs::write(&zip_file_path, test_archives::postgres_zip(true)).unwrap();
+
+        unpack_postgres(&zip_file_path, &cache_dir)
+            .await
+            .unwrap_err();
+        let own_prefix = format!("{}{}-", UNPACK_STAGING_DIR_PREFIX, std::process::id());
+        let own_staging_dirs: Vec<String> = test_archives::staging_dir_names(&cache_dir)
+            .into_iter()
+            .filter(|name| name.starts_with(&own_prefix))
+            .collect();
+        assert!(own_staging_dirs.is_empty(), "{:?}", own_staging_dirs);
+    }
+
+    #[test]
+    fn leftover_cleanup_removes_other_pid_staging_dirs_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path();
+        let killed_staging_dir = cache_dir.join(test_archives::killed_process_staging_dir_name());
+        std::fs::create_dir_all(killed_staging_dir.join("bin")).unwrap();
+        let live_peer_staging_dir = cache_dir.join(format!(
+            "{}{}-999999",
+            UNPACK_STAGING_DIR_PREFIX,
+            std::process::id()
+        ));
+        std::fs::create_dir_all(live_peer_staging_dir.join("bin")).unwrap();
+        let malformed_staging_dir = cache_dir.join(format!("{}abc-1", UNPACK_STAGING_DIR_PREFIX));
+        std::fs::create_dir_all(&malformed_staging_dir).unwrap();
+        std::fs::create_dir_all(cache_dir.join("bin")).unwrap();
+
+        remove_leftover_staging_dirs(cache_dir).unwrap();
+        assert!(!killed_staging_dir.exists());
+        assert!(live_peer_staging_dir.join("bin").exists());
+        assert!(malformed_staging_dir.exists());
+        assert!(cache_dir.join("bin").exists());
+    }
+
+    #[test]
+    fn leftover_cleanup_of_a_missing_cache_dir_is_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        remove_leftover_staging_dirs(&dir.path().join("absent")).unwrap();
     }
 
     #[tokio::test]
@@ -335,7 +516,7 @@ mod tests {
     async fn unpack_postgres_clears_a_staging_dir_left_by_a_killed_extraction() {
         let dir = tempfile::tempdir().unwrap();
         let cache_dir = dir.path().to_path_buf();
-        let staging_dir = cache_dir.join(UNPACK_STAGING_DIR_NAME);
+        let staging_dir = cache_dir.join(test_archives::killed_process_staging_dir_name());
         std::fs::create_dir_all(staging_dir.join("bin")).unwrap();
         std::fs::write(initdb_path(&staging_dir), b"partial initdb").unwrap();
         std::fs::write(staging_dir.join("stale-file"), b"stale").unwrap();
@@ -346,13 +527,15 @@ mod tests {
         assert!(!cache_dir.join("stale-file").exists());
     }
 
+    // A process killed during the move phase has already moved `lib` and left `bin` (always
+    // last) in its staging dir.
     #[tokio::test]
     async fn unpack_postgres_replaces_entries_left_by_a_killed_move() {
         let dir = tempfile::tempdir().unwrap();
         let cache_dir = dir.path().to_path_buf();
         std::fs::create_dir_all(cache_dir.join("lib")).unwrap();
         std::fs::write(cache_dir.join("lib").join("stale-file"), b"stale").unwrap();
-        let staging_dir = cache_dir.join(UNPACK_STAGING_DIR_NAME);
+        let staging_dir = cache_dir.join(test_archives::killed_process_staging_dir_name());
         std::fs::create_dir_all(staging_dir.join("bin")).unwrap();
         std::fs::write(initdb_path(&staging_dir), b"fake initdb").unwrap();
         let zip_file_path = write_good_zip(&cache_dir);
@@ -380,6 +563,7 @@ mod tests {
         );
         let libfake = std::fs::metadata(cache_dir.join("lib").join("libfake")).unwrap();
         assert_eq!(libfake.len(), 100_000);
-        assert!(!cache_dir.join(UNPACK_STAGING_DIR_NAME).exists());
+        let staging_dir_names = test_archives::staging_dir_names(cache_dir);
+        assert!(staging_dir_names.is_empty(), "{:?}", staging_dir_names);
     }
 }
