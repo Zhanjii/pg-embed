@@ -14,13 +14,17 @@ start trusts the partial tree (LD-P15-Q2-003, Known limits of pg-embed#4).
 
 ## Design
 
-1. **Extract into a staging dir.** `unpack_postgres` extracts the tar into
-   `cache_dir/.unpack-staging` (constant `UNPACK_STAGING_DIR_NAME`), not into `cache_dir`. It sits
-   inside `cache_dir`, so it is on the same volume and `rename` is a metadata move on
-   macOS/Linux/Windows. `pg_executables_cached()` never looks inside it.
-2. **Clean a leftover first.** Before extracting, `remove_dir_all` the staging dir (`NotFound` is
-   fine). A leftover from a killed run is therefore ignored by the presence check and cleaned by
-   the next acquire.
+1. **Extract into a staging dir.** `unpack_postgres` extracts the tar into its own
+   `cache_dir/.unpack-staging-<pid>-<seq>` (prefix constant `UNPACK_STAGING_DIR_PREFIX`; `seq`
+   from a process-wide `AtomicU64`), not into `cache_dir`. It sits inside `cache_dir`, so it is
+   on the same volume and `rename` is a metadata move on macOS/Linux/Windows.
+   `pg_executables_cached()` never looks inside it.
+2. **Clean leftovers first.** `remove_leftover_staging_dirs` removes every staging dir in
+   `cache_dir` named with another pid (only a killed process leaves one); same-pid and malformed
+   names are left alone. `acquire_postgres_steps` runs it before the download, and
+   `unpack_postgres` again for direct callers; a failure is logged, not returned. A leftover is
+   therefore ignored by the presence check and cleaned by the next acquire. A failed run removes
+   its own staging dir.
 3. **Move into place, `bin` last.** After a successful extraction, every top-level entry of the
    staging dir is renamed into `cache_dir`. An existing destination entry (left by a run killed
    during this move phase, or by a pre-fix partial tree) is removed first: `remove_dir_all` for a
@@ -55,6 +59,14 @@ start trusts the partial tree (LD-P15-Q2-003, Known limits of pg-embed#4).
   `lib`/`share`/`include`, so a release with an extra top-level dir still works.
 - LD-P15-B3-005: `unpack_postgres`'s public signature is unchanged; the staging logic is
   internal to `pg_unpack.rs`.
+- LD-P15-B3-006: Per-run staging names (`.unpack-staging-<pid>-<seq>`); the leftover cleanup
+  removes other-pid staging dirs only; it runs at the start of `acquire_postgres_steps`, before
+  the download; a failed run removes its own staging dir. Reasons (challenge iteration 1): a
+  shared fixed name let one in-process run's cleanup delete a peer's half-written tree, which
+  was then moved into place and trusted; and cleanup after the zip write never freed a leftover
+  on a disk too full for that write. The move phase also holds a process-wide lock and removes
+  `cache_dir/bin` first, so an in-process peer can never replace `lib`/`share` while a `bin`
+  is in place. LD-P15-B3-001 and -003's `.unpack-staging` now read `.unpack-staging-<pid>-<seq>`.
 - LD-P15-B3-REVIEWBAR: BLOCKER only: a killed or failed extraction still yields a trusted tree,
   a good archive now fails, an existing complete cache is re-extracted on every start, or the
   InSync pin breaks a build. Upstream limits are NITs. Converge.
@@ -66,9 +78,22 @@ start trusts the partial tree (LD-P15-Q2-003, Known limits of pg-embed#4).
   re-extract every complete cache once; out of scope (LD-P15-B3-002). InSync release builds use
   the bundle (local mode) and never download, so only dev/headless download installs are affected.
 - A kill after the `bin` rename but before the empty staging dir is removed leaves an empty
-  `.unpack-staging` until the next acquire, which never comes for a complete cache. Harmless.
+  `.unpack-staging-<pid>-<seq>` until the next acquire, which never comes for a complete cache.
+  Harmless.
+- Pre-existing, not closed here: two in-process first acquisitions that overlap also share the
+  zip, `.txz` and `.tar` paths. If one rewrites the `.tar` while the other extracts, a cut on an
+  entry boundary reads as a clean end and the shorter tree is moved into place. Closing it needs
+  per-run intermediate paths (upstream behaviour; a NIT under the review bar).
 - On Windows, antivirus can briefly lock a freshly extracted file and make a rename fail. That
   surfaces as `UnpackFailure`, the status resets, and the next start retries.
+- Overlapping acquisitions of one cache dir from two processes are unsupported, as upstream:
+  they share the zip, `.txz` and `.tar` paths, and the other-pid staging dir of a live process
+  would be removed by the leftover cleanup.
+- Pid reuse can leave a leftover uncleaned (a later process with the same pid treats it as a
+  live peer's). That is a disk-space leak, never a trusted tree.
+- No fsync of the extracted files or the renames: after an OS crash or power loss a persisted
+  `bin` rename could sit next to file data that never reached disk. The target is process
+  kills, not power loss.
 - The `tests/` integration tests are not run: they call `purge()`, which deletes the real
   `~/Library/Caches/pg-embed`.
 

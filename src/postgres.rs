@@ -186,6 +186,17 @@ impl PgEmbed {
     }
 
     async fn acquire_postgres_steps(&self) -> PgResult<()> {
+        // Before the download, so a staging dir left by a killed unpack (hundreds of MB) is
+        // freed even when the zip write then fails, as it can on every start on a nearly full
+        // disk. Only logged: the presence check never looks inside a staging dir, so a
+        // leftover costs disk space, never correctness, and failing here would block an
+        // acquisition that may well succeed.
+        if let Err(error) = pg_unpack::remove_leftover_staging_dirs(&self.pg_access.cache_dir) {
+            log::warn!(
+                "could not remove a staging dir left by a killed unpack: {}",
+                error
+            );
+        }
         let pg_bin_data = &self.fetch_settings.fetch_postgres().await?;
         self.pg_access.write_pg_zip(&pg_bin_data).await?;
         if let Err(unpack_error) =
@@ -595,7 +606,7 @@ mod tests {
         let temporary_directory = tempfile::tempdir().unwrap();
         let cache_dir = temporary_directory.path().join("cache");
         let staging_bin = cache_dir
-            .join(crate::pg_unpack::UNPACK_STAGING_DIR_NAME)
+            .join(crate::pg_unpack::test_archives::killed_process_staging_dir_name())
             .join("bin");
         std::fs::create_dir_all(&staging_bin).unwrap();
         std::fs::write(
@@ -629,13 +640,43 @@ mod tests {
 
         pg.acquire_postgres().await.unwrap();
         assert!(pg.pg_access.init_db_exe.exists());
-        assert!(!cache_dir
-            .join(crate::pg_unpack::UNPACK_STAGING_DIR_NAME)
-            .exists());
+        let staging_dir_names = crate::pg_unpack::test_archives::staging_dir_names(&cache_dir);
+        assert!(staging_dir_names.is_empty(), "{:?}", staging_dir_names);
         assert!(
             pg.pg_access.acquisition_status().await
                 == crate::pg_enums::PgAcquisitionStatus::Finished
         );
+    }
+
+    // On a nearly full disk the zip write can fail on every start; the leftover, which may be
+    // what fills the disk, must still be freed.
+    #[tokio::test]
+    async fn leftover_staging_dir_is_removed_even_when_the_download_fails() {
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let cache_dir = temporary_directory.path().join("cache");
+        let leftover_staging_dir =
+            cache_dir.join(crate::pg_unpack::test_archives::killed_process_staging_dir_name());
+        std::fs::create_dir_all(leftover_staging_dir.join("bin")).unwrap();
+        let host = crate::pg_fetch::serve_once("404 Not Found", b"not here".to_vec()).await;
+        // A struct literal: PgEmbed::new in remote mode would create the real user cache.
+        let mut pg = PgEmbed {
+            pg_settings: settings_for(temporary_directory.path().join("db")),
+            fetch_settings: PgFetchSettings {
+                host,
+                ..Default::default()
+            },
+            db_uri: "postgres://postgres:password@localhost:5432".to_string(),
+            server_status: Arc::new(Mutex::new(PgServerStatus::Uninitialized)),
+            shutting_down: false,
+            pg_access: crate::pg_access::access_for(&cache_dir),
+        };
+        // Drop must neither run pg_ctl nor clean anything up.
+        pg.shutting_down = true;
+        pg.pg_settings.persistent = true;
+
+        let error = pg.acquire_postgres().await.unwrap_err();
+        assert_eq!(error.error_type, PgEmbedErrorType::DownloadFailure);
+        assert!(!leftover_staging_dir.exists());
     }
 
     // End to end for the claim guard: a timeout around acquisition (the typical way callers
