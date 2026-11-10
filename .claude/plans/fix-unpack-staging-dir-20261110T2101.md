@@ -24,8 +24,8 @@ start trusts the partial tree (LD-P15-Q2-003, Known limits of pg-embed#4).
    in `cache_dir` named with another pid (only a killed process leaves one); same-pid (a live
    in-process peer's) and malformed names are left alone. It runs at the start of
    `acquire_postgres_steps`, before the download, and again in `unpack_postgres` for direct
-   callers. It is warn-only: a failure is logged, not returned, since a leftover costs disk
-   space, never correctness.
+   callers. It is warn-only: each failure is logged and the rest are still tried, since a
+   leftover costs disk space, never correctness.
 3. **Move into place, old `bin` away first, new `bin` last.** After a successful extraction the
    move phase runs under a process-wide lock. It creates `<staging_dir>/.replaced-entries`
    (`create_dir` fails if the archive itself has that name), then renames the existing
@@ -33,15 +33,19 @@ start trusts the partial tree (LD-P15-Q2-003, Known limits of pg-embed#4).
    to half-deleted binaries. Each other top-level staging entry then has its existing
    destination (left by a run killed during this phase, by a pre-fix partial tree, or by a
    complete prior tree) renamed into `.replaced-entries` and is renamed into `cache_dir`. Then
-   `.replaced-entries` is deleted, the new `bin` is renamed in, and the now-empty staging dir is
-   removed. A kill after any rename into `.replaced-entries` leaves the old entry inside a
+   the new `bin` is renamed in, the lock is released, and the staging dir is deleted with
+   `.replaced-entries` inside it; deleting the old entries only after the `bin` rename keeps the
+   cache unusable no longer than the renames take. A failure of that delete is logged at warn,
+   not returned: the tree is complete, and an error would make the caller delete a valid
+   initdb. A kill after any rename into `.replaced-entries` leaves the old entry inside a
    staging dir, which the leftover cleanup removes. `initdb` is the only presence marker, so a
    kill at any point before the final `bin` rename leaves no `cache_dir/bin/initdb`, and the
-   next start re-acquires.
+   next start re-acquires. Every `UnpackFailure` from the move phase means that rename did not
+   happen.
 4. **Synchronous.** Cleanup, extraction and moves are all `std::fs`, with no await in between
    (the same cancellation reasoning as pg-embed#4). The move lock is never held across an await.
-5. **Errors.** A failed staging cleanup in the move phase or a failed move is `UnpackFailure`
-   with the path in `message`. A failed extraction keeps pg-embed#4's behaviour: the `.tar` is
+5. **Errors.** A failed move before the final `bin` rename is `UnpackFailure` with the path in
+   `message`; the staging delete after it is warn-only (Design 3). A failed extraction keeps pg-embed#4's behaviour: the `.tar` is
    removed and the extraction error wins. A failed extraction or move removes its own staging
    dir (a failure there is logged, so the original error is returned). The `init_db_exe`
    invalidation in `acquire_postgres_steps` stays as it is (now normally `NotFound`, kept as
@@ -83,9 +87,9 @@ start trusts the partial tree (LD-P15-Q2-003, Known limits of pg-embed#4).
   `bin/initdb` and stays trusted. Detecting it would need a completion marker, which would also
   re-extract every complete cache once; out of scope (LD-P15-B3-002). InSync release builds use
   the bundle (local mode) and never download, so only dev/headless download installs are affected.
-- A kill after the `bin` rename but before the empty staging dir is removed leaves an empty
-  `.unpack-staging-<pid>-<seq>` until the next acquire, which never comes for a complete cache.
-  Harmless.
+- A kill after the `bin` rename but before the staging dir is deleted, or a failed delete,
+  leaves `.unpack-staging-<pid>-<seq>` (holding any replaced entries) until the next acquire,
+  which never comes for a complete cache. A disk-space leak, never a trusted partial tree.
 - Pre-existing, not closed here: two in-process first acquisitions that overlap also share the
   zip, `.txz` and `.tar` paths. If one rewrites the `.tar` while the other extracts, a cut on an
   entry boundary reads as a clean end and the shorter tree is moved into place. Closing it needs
@@ -101,7 +105,10 @@ start trusts the partial tree (LD-P15-Q2-003, Known limits of pg-embed#4).
   replacement can fail on in-use files, giving `UnpackFailure` and a re-download on the next
   start, never a trusted partial tree.
 - Pid reuse can leave a leftover uncleaned (a later process with the same pid treats it as a
-  live peer's). That is a disk-space leak, never a trusted tree.
+  live peer's). That is a disk-space leak, never a trusted tree. Its sequence also restarts at
+  0, so its own staging name can equal such a leftover; each run therefore removes whatever
+  sits at its own staging path and recreates it empty before extracting
+  (`prepare_own_staging_dir`), so stale files never mix into the tree it moves into place.
 - No fsync of the extracted files or the renames: after an OS crash or power loss a persisted
   `bin` rename could sit next to file data that never reached disk. The target is process
   kills, not power loss.
@@ -140,7 +147,7 @@ start trusts the partial tree (LD-P15-Q2-003, Known limits of pg-embed#4).
 - [x] 3. `postgres.rs`: comment touch-up only where it describes the partial tree; no logic
       change. Sensitive: no
 - [x] 4. CHANGELOG Unreleased → Fix entry. Sensitive: no
-- [x] 5. Gate: `bash .claude/validate.sh` (55/55 lib tests, 5 new) (fmt, build, lib tests, no new clippy vs baseline).
+- [x] 5. Gate: `bash .claude/validate.sh` (55/55 lib tests, 5 new; 63/63 after the review fixes, incl. the move-phase failure and `prepare_own_staging_dir` tests) (fmt, build, lib tests, no new clippy vs baseline).
       Never run `tests/` or `purge()`. Sensitive: no
 - [x] 6. (Done: top level `bin`, `lib`, `share` plus the zip, no staging dir, 18 `lib` symlinks
       with 0 broken, `initdb --version` = PostgreSQL 15.1; probe reverted, scratch deleted.)

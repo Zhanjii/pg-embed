@@ -188,15 +188,8 @@ impl PgEmbed {
     async fn acquire_postgres_steps(&self) -> PgResult<()> {
         // Before the download, so a staging dir left by a killed unpack (hundreds of MB) is
         // freed even when the zip write then fails, as it can on every start on a nearly full
-        // disk. Only logged: the presence check never looks inside a staging dir, so a
-        // leftover costs disk space, never correctness, and failing here would block an
-        // acquisition that may well succeed.
-        if let Err(error) = pg_unpack::remove_leftover_staging_dirs(&self.pg_access.cache_dir) {
-            log::warn!(
-                "could not remove a staging dir left by a killed unpack: {}",
-                error
-            );
-        }
+        // disk. Warn-only, see remove_leftover_staging_dirs.
+        pg_unpack::remove_leftover_staging_dirs(&self.pg_access.cache_dir);
         let pg_bin_data = &self.fetch_settings.fetch_postgres().await?;
         self.pg_access.write_pg_zip(&pg_bin_data).await?;
         if let Err(unpack_error) =
@@ -206,8 +199,9 @@ impl PgEmbed {
             // "Binaries cached" is decided by the presence of initdb alone, so a tree that
             // failed part way through must not keep it or every later start would trust it.
             // unpack_postgres confines a failed extraction to its own staging dir and removes
-            // it, and moves `bin` in last, so initdb is normally absent here; this stays as
-            // defence in depth (e.g. a failed move next to a `bin` left by an older pg-embed's
+            // it, and an UnpackFailure from its move phase always means the final `bin` rename
+            // did not happen, so initdb is normally absent here; this stays as defence in
+            // depth (e.g. a move that failed to take away a `bin` left by an older pg-embed's
             // partial tree).
             // A cleanup failure means the tree is untouched or complete, so it is left alone.
             // Synchronous, with no await since the failed extraction, so a cancellation

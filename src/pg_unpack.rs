@@ -73,29 +73,48 @@ fn staging_dir_owner_pid(entry_name: &std::ffi::OsStr) -> Option<u32> {
 /// missing parent dirs, so that peer could then move a tree with holes into place, and it
 /// would be trusted.
 ///
-/// Returns `Ok(())` on success, otherwise returns an error.
+/// Failures are logged, not returned, and one leftover that cannot be removed does not stop
+/// the rest: the presence check never looks inside a staging dir, so a leftover costs disk
+/// space, never correctness, and failing would block an acquisition that may well succeed.
 ///
-pub(crate) fn remove_leftover_staging_dirs(cache_dir: &Path) -> PgResult<()> {
+pub(crate) fn remove_leftover_staging_dirs(cache_dir: &Path) {
     let entries = match std::fs::read_dir(cache_dir) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
         Err(error) => {
-            return Err(unpack_failure(
-                error,
-                format!("could not list {}", cache_dir.display()),
-            ))
+            log::warn!(
+                "could not list {} to remove staging dirs left by a killed unpack: {}",
+                cache_dir.display(),
+                error
+            );
+            return;
         }
     };
     let own_pid = std::process::id();
     for entry in entries {
-        let entry = entry
-            .map_err(|e| unpack_failure(e, format!("could not list {}", cache_dir.display())))?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                log::warn!(
+                    "could not list {} to remove staging dirs left by a killed unpack: {}",
+                    cache_dir.display(),
+                    error
+                );
+                continue;
+            }
+        };
         match staging_dir_owner_pid(&entry.file_name()) {
-            Some(owner_pid) if owner_pid != own_pid => remove_path_if_present(&entry.path())?,
+            Some(owner_pid) if owner_pid != own_pid => {
+                if let Err(error) = remove_path_if_present(&entry.path()) {
+                    log::warn!(
+                        "could not remove a staging dir left by a killed unpack: {}",
+                        error
+                    );
+                }
+            }
             _ => {}
         }
     }
-    Ok(())
 }
 
 ///
@@ -225,9 +244,9 @@ fn remove_path_if_present(path: &Path) -> PgResult<()> {
 
 ///
 /// Move every top-level entry of the extracted staging tree into the cache dir, then remove
-/// the empty staging dir
+/// the staging dir with the entries it replaced
 ///
-/// Returns `Ok(())` on success, otherwise returns an error.
+/// Returns `Ok(())` once `bin` is in place, otherwise returns an error.
 ///
 fn move_staged_tree_into_place(staging_dir: &Path, cache_dir: &Path) -> PgResult<()> {
     let mut entry_names = Vec::new();
@@ -245,17 +264,18 @@ fn move_staged_tree_into_place(staging_dir: &Path, cache_dir: &Path) -> PgResult
     // Replaced entries are renamed into this run's staging dir and deleted there, because an
     // in-place delete is not atomic: a kill partway through could leave `bin/initdb` next to
     // already deleted binaries, and that tree would be trusted. A kill after the rename
-    // leaves the old entry inside a staging dir, which the leftover cleanup removes.
-    // `create_dir` fails if the archive itself has an entry of that name, so the two can
-    // never mix.
+    // leaves the old entry inside a staging dir, which the leftover cleanup removes. They are
+    // deleted only after the final `bin` rename, so the cache is unusable no longer than the
+    // renames take. `create_dir` fails if the archive itself has an entry of that name, so
+    // the two can never mix.
     let replaced_entries_dir = staging_dir.join(REPLACED_ENTRIES_DIR_NAME);
     // No trusted partial tree when two runs in this process overlap: the lock keeps one run's
     // replacements from opening a hole in the tree the other has just completed with `bin`,
     // and the old `bin` goes first so initdb is absent while any entry is being replaced. A
     // failure anywhere before the `bin` rename is an UnpackFailure with initdb absent, so the
-    // next start re-downloads. The lock is never held across an await. A poisoned lock only
+    // next start re-downloads; nothing after it returns an error. The lock is never held across an await. A poisoned lock only
     // means a peer panicked mid-move, which this run's full replacement repairs.
-    let _move_guard = MOVE_INTO_PLACE_LOCK
+    let move_guard = MOVE_INTO_PLACE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     std::fs::create_dir(&replaced_entries_dir).map_err(|e| {
@@ -276,12 +296,20 @@ fn move_staged_tree_into_place(staging_dir: &Path, cache_dir: &Path) -> PgResult
         )?;
         rename_entry(&staging_dir.join(&entry_name), &cache_dir.join(&entry_name))?;
     }
-    remove_path_if_present(&replaced_entries_dir)?;
     if moves_bin {
         rename_entry(&staging_dir.join("bin"), &cache_dir.join("bin"))?;
     }
-    std::fs::remove_dir(staging_dir)
-        .map_err(|e| unpack_failure(e, format!("could not remove {}", staging_dir.display())))
+    // Peers never touch this run's staging dir, so the slow delete needs no lock.
+    drop(move_guard);
+    // The tree is complete now: an error would make the caller delete a valid initdb, so a
+    // failure only costs disk space and is logged.
+    if let Err(error) = remove_path_if_present(staging_dir) {
+        log::warn!(
+            "could not remove the staging dir after a successful unpack: {}",
+            error
+        );
+    }
+    Ok(())
 }
 
 ///
@@ -315,6 +343,20 @@ fn move_existing_entry_away(existing_entry: &Path, replaced_entry: &Path) -> PgR
 }
 
 ///
+/// Make this run's staging dir an empty dir before the extraction
+///
+/// In-process peers get distinct sequence numbers, so anything already at this path was left
+/// by a killed earlier process whose pid this one reused (its sequence also started at 0);
+/// the leftover cleanup skips it as same-pid. Extracting on top of it would mix its stale
+/// files into the tree that is moved into place.
+///
+fn prepare_own_staging_dir(staging_dir: &Path) -> PgResult<()> {
+    remove_path_if_present(staging_dir)?;
+    std::fs::create_dir(staging_dir)
+        .map_err(|e| unpack_failure(e, format!("could not create {}", staging_dir.display())))
+}
+
+///
 /// Remove this run's staging dir after its extraction or move failed
 ///
 /// The leftover cleanup never touches a staging dir of this process, so without this a
@@ -339,13 +381,7 @@ pub async fn unpack_postgres(zip_file_path: &PathBuf, cache_dir: &PathBuf) -> Pg
     // The tar is extracted into a staging dir, out of the presence check's sight, so a process
     // killed mid-extraction leaves nothing a later start trusts. acquire_postgres has already
     // cleared leftovers before downloading; this repeat covers direct callers of this pub fn.
-    // A failure only costs disk space (see acquire_postgres_steps), so it is logged.
-    if let Err(error) = remove_leftover_staging_dirs(cache_dir) {
-        log::warn!(
-            "could not remove a staging dir left by a killed unpack: {}",
-            error
-        );
-    }
+    remove_leftover_staging_dirs(cache_dir);
     let staging_dir = new_unpack_staging_dir(cache_dir);
     let txz_file_path = unzip_txz(&zip_file_path, &cache_dir)?;
     let tar_file_path = decompress_xz(&txz_file_path)?;
@@ -356,7 +392,8 @@ pub async fn unpack_postgres(zip_file_path: &PathBuf, cache_dir: &PathBuf) -> Pg
             message: None,
         })
         .await?;
-    let extraction_result = decompress_tar(&tar_file_path, &staging_dir);
+    let extraction_result = prepare_own_staging_dir(&staging_dir)
+        .and_then(|()| decompress_tar(&tar_file_path, &staging_dir));
     // The tar is removed whatever the extraction result, so a failure does not leave a
     // large intermediate behind. Synchronously, like the extraction and the moves: an await
     // here would let a cancellation (e.g. a timeout around setup()) drop the future between a
@@ -533,7 +570,7 @@ mod tests {
         std::fs::create_dir_all(&malformed_staging_dir).unwrap();
         std::fs::create_dir_all(cache_dir.join("bin")).unwrap();
 
-        remove_leftover_staging_dirs(cache_dir).unwrap();
+        remove_leftover_staging_dirs(cache_dir);
         assert!(!killed_staging_dir.exists());
         assert!(live_peer_staging_dir.join("bin").exists());
         assert!(malformed_staging_dir.exists());
@@ -543,7 +580,78 @@ mod tests {
     #[test]
     fn leftover_cleanup_of_a_missing_cache_dir_is_ok() {
         let dir = tempfile::tempdir().unwrap();
-        remove_leftover_staging_dirs(&dir.path().join("absent")).unwrap();
+        remove_leftover_staging_dirs(&dir.path().join("absent"));
+    }
+
+    // A reused pid restarts at sequence 0, so its staging path can be a killed process's
+    // leftover, which the leftover cleanup skips as same-pid.
+    #[test]
+    fn prepare_own_staging_dir_empties_a_leftover_at_its_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging_dir = dir.path().join(format!(
+            "{}{}-0",
+            UNPACK_STAGING_DIR_PREFIX,
+            std::process::id()
+        ));
+        std::fs::create_dir_all(staging_dir.join("bin")).unwrap();
+        std::fs::write(staging_dir.join("stale-file"), b"stale").unwrap();
+
+        prepare_own_staging_dir(&staging_dir).unwrap();
+        assert!(staging_dir.is_dir());
+        assert_eq!(std::fs::read_dir(&staging_dir).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn prepare_own_staging_dir_creates_a_missing_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging_dir = dir.path().join("fresh");
+
+        prepare_own_staging_dir(&staging_dir).unwrap();
+        assert!(staging_dir.is_dir());
+    }
+
+    // The move phase fails after the old complete `bin` was taken away: renaming a directory
+    // to a new parent needs write permission on the directory itself (to update its `..`), so
+    // a read-only `lib` cannot be moved into `.replaced-entries`, and `bin` is always moved
+    // before any other entry. A `.replaced-entries` entry in the archive would fail earlier,
+    // in `create_dir`, before the old `bin` moves, and so would not exercise this ordering.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_move_after_the_old_bin_left_leaves_no_initdb() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().to_path_buf();
+        std::fs::create_dir_all(cache_dir.join("bin")).unwrap();
+        std::fs::write(initdb_path(&cache_dir), b"old initdb").unwrap();
+        std::fs::write(cache_dir.join("bin").join("postgres"), b"old postgres").unwrap();
+        let old_lib = cache_dir.join("lib");
+        std::fs::create_dir_all(&old_lib).unwrap();
+        std::fs::write(old_lib.join("libold"), b"old lib").unwrap();
+        std::fs::set_permissions(&old_lib, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Root ignores the permission, so the move would succeed and prove nothing.
+        if std::fs::write(old_lib.join("write-probe"), b"").is_ok() {
+            std::fs::set_permissions(&old_lib, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+        let zip_file_path = write_good_zip(&cache_dir);
+
+        let result = unpack_postgres(&zip_file_path, &cache_dir).await;
+        std::fs::set_permissions(&old_lib, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let error = result.unwrap_err();
+        assert_eq!(
+            error.error_type,
+            PgEmbedErrorType::UnpackFailure,
+            "{:?}",
+            error
+        );
+        assert!(!initdb_path(&cache_dir).exists());
+        let own_prefix = format!("{}{}-", UNPACK_STAGING_DIR_PREFIX, std::process::id());
+        let own_staging_dirs: Vec<String> = test_archives::staging_dir_names(&cache_dir)
+            .into_iter()
+            .filter(|name| name.starts_with(&own_prefix))
+            .collect();
+        assert!(own_staging_dirs.is_empty(), "{:?}", own_staging_dirs);
     }
 
     #[tokio::test]
