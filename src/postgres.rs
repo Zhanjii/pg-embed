@@ -205,9 +205,10 @@ impl PgEmbed {
         {
             // "Binaries cached" is decided by the presence of initdb alone, so a tree that
             // failed part way through must not keep it or every later start would trust it.
-            // unpack_postgres keeps a failed extraction in its staging dir and moves `bin` in
-            // last, so initdb is normally absent here; this stays as defence in depth (e.g. a
-            // failed move next to a `bin` left by an older pg-embed's partial tree).
+            // unpack_postgres confines a failed extraction to its own staging dir and removes
+            // it, and moves `bin` in last, so initdb is normally absent here; this stays as
+            // defence in depth (e.g. a failed move next to a `bin` left by an older pg-embed's
+            // partial tree).
             // A cleanup failure means the tree is untouched or complete, so it is left alone.
             // Synchronous, with no await since the failed extraction, so a cancellation
             // cannot skip it.
