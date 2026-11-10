@@ -800,6 +800,20 @@ mod tests {
         assert!(!access.acquisition_needed().await.unwrap());
     }
 
+    // A kill after the final `bin` move but before the empty staging dir is removed must not
+    // make a complete cache re-extract on every start.
+    #[tokio::test]
+    async fn complete_cache_with_leftover_staging_dir_is_still_cached() {
+        let installation = fake_installation(&[]);
+        let staging_dir = installation
+            .path()
+            .join(crate::pg_unpack::UNPACK_STAGING_DIR_NAME);
+        std::fs::create_dir_all(staging_dir.join("bin")).unwrap();
+        let access = access_for(installation.path());
+        assert!(access.pg_executables_cached().await.unwrap());
+        assert!(!access.acquisition_needed().await.unwrap());
+    }
+
     #[tokio::test]
     async fn download_mode_reports_missing_initdb_as_not_cached() {
         let installation = fake_installation(&["initdb"]);

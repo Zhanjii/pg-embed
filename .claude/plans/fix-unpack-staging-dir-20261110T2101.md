@@ -76,7 +76,7 @@ start trusts the partial tree (LD-P15-Q2-003, Known limits of pg-embed#4).
 
 ### Fork PR (Zhanjii/pg-embed → `fix/fsync-on`)
 
-- [ ] 1. Tests first; they must fail before the fix. Sensitive: no
+- [x] 1. Tests first; they must fail before the fix. Sensitive: no
   - `pg_unpack` unit test: the corrupt archive still returns `UnpackFailure` and leaves no
     `.tar`/`.txz`, and now leaves **no** `cache_dir/bin/initdb` (the existing test's premise
     flips: the partial tree is in staging).
@@ -94,12 +94,16 @@ start trusts the partial tree (LD-P15-Q2-003, Known limits of pg-embed#4).
     and the status is `Finished`.
   - `pg_access` test: a complete `cache_dir/bin/initdb` next to a leftover staging dir still
     reads as cached (no re-extraction).
-- [ ] 2. `pg_unpack.rs`: staging cleanup, extraction into staging, then the bin-last move and
+- [x] 2. `pg_unpack.rs`: staging cleanup, extraction into staging, then the bin-last move and
       staging removal (Design 1-5). Sensitive: yes (crash ordering)
-- [ ] 3. `postgres.rs`: comment touch-up only where it describes the partial tree; no logic
+      Note: if the `.tar` removal fails after a good extraction, the tree is still moved into
+      place and `PgCleanUpFailure` is returned, so that error keeps meaning "cache dir untouched
+      or complete" (the caller's skip-invalidation stays correct). If a move also fails, the
+      move's `UnpackFailure` wins and the cleanup error is logged at warn.
+- [x] 3. `postgres.rs`: comment touch-up only where it describes the partial tree; no logic
       change. Sensitive: no
-- [ ] 4. CHANGELOG Unreleased → Fix entry. Sensitive: no
-- [ ] 5. Gate: `bash .claude/validate.sh` (fmt, build, lib tests, no new clippy vs baseline).
+- [x] 4. CHANGELOG Unreleased → Fix entry. Sensitive: no
+- [x] 5. Gate: `bash .claude/validate.sh` (55/55 lib tests, 5 new) (fmt, build, lib tests, no new clippy vs baseline).
       Never run `tests/` or `purge()`. Sensitive: no
 - [ ] 6. Real-archive check, read-only, in a scratch dir: download the PG 15.1.0 darwin-amd64
       zip from Maven into a scratch dir (never read or write `~/Library/Caches/pg-embed`) and run

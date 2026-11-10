@@ -194,6 +194,9 @@ impl PgEmbed {
         {
             // "Binaries cached" is decided by the presence of initdb alone, so a tree that
             // failed part way through must not keep it or every later start would trust it.
+            // unpack_postgres keeps a failed extraction in its staging dir and moves `bin` in
+            // last, so initdb is normally absent here; this stays as defence in depth (e.g. a
+            // failed move next to a `bin` left by an older pg-embed's partial tree).
             // A cleanup failure means the tree is untouched or complete, so it is left alone.
             // Synchronous, with no await since the failed extraction, so a cancellation
             // cannot skip it.
@@ -574,7 +577,8 @@ mod tests {
             "{:?}",
             error
         );
-        // The first tar entry (initdb) was fully extracted before the failure.
+        // The first tar entry (initdb) was fully extracted before the failure, into the
+        // staging dir, so it never reached the cache dir.
         assert!(!pg.pg_access.init_db_exe.exists());
         assert!(!pg.pg_access.pg_executables_cached().await.unwrap());
         assert!(
@@ -582,6 +586,56 @@ mod tests {
                 == crate::pg_enums::PgAcquisitionStatus::Undefined
         );
         assert!(pg.pg_access.acquisition_needed().await.unwrap());
+    }
+
+    // A process killed mid-extraction leaves its partial tree in the staging dir: the next
+    // start must not trust it, and its acquisition must clean it up and complete the cache.
+    #[tokio::test]
+    async fn leftover_staging_tree_is_not_trusted_and_next_acquire_completes_cache() {
+        let temporary_directory = tempfile::tempdir().unwrap();
+        let cache_dir = temporary_directory.path().join("cache");
+        let staging_bin = cache_dir
+            .join(crate::pg_unpack::UNPACK_STAGING_DIR_NAME)
+            .join("bin");
+        std::fs::create_dir_all(&staging_bin).unwrap();
+        std::fs::write(
+            staging_bin.join(format!("initdb{}", std::env::consts::EXE_SUFFIX)),
+            b"partial initdb",
+        )
+        .unwrap();
+        let host = crate::pg_fetch::serve_once(
+            "200 OK",
+            crate::pg_unpack::test_archives::postgres_zip(false),
+        )
+        .await;
+        // A struct literal: PgEmbed::new in remote mode would create the real user cache.
+        let mut pg = PgEmbed {
+            pg_settings: settings_for(temporary_directory.path().join("db")),
+            fetch_settings: PgFetchSettings {
+                host,
+                ..Default::default()
+            },
+            db_uri: "postgres://postgres:password@localhost:5432".to_string(),
+            server_status: Arc::new(Mutex::new(PgServerStatus::Uninitialized)),
+            shutting_down: false,
+            pg_access: crate::pg_access::access_for(&cache_dir),
+        };
+        // Drop must neither run pg_ctl nor clean anything up.
+        pg.shutting_down = true;
+        pg.pg_settings.persistent = true;
+
+        assert!(!pg.pg_access.pg_executables_cached().await.unwrap());
+        assert!(pg.pg_access.acquisition_needed().await.unwrap());
+
+        pg.acquire_postgres().await.unwrap();
+        assert!(pg.pg_access.init_db_exe.exists());
+        assert!(!cache_dir
+            .join(crate::pg_unpack::UNPACK_STAGING_DIR_NAME)
+            .exists());
+        assert!(
+            pg.pg_access.acquisition_status().await
+                == crate::pg_enums::PgAcquisitionStatus::Finished
+        );
     }
 
     // End to end for the claim guard: a timeout around acquisition (the typical way callers
